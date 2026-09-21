@@ -13,6 +13,7 @@ use input_capture::{
 use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use mousehop_ipc::CrossingModifier;
+use mousehop_proto::transport::CAP_UDP_MOTION_V1;
 use mousehop_proto::{
     CAP_ATOMIC_HANDOVER, CAP_TRANSACTIONAL_HANDOVER, HandoverWarpStatus,
     HostInputState as ProtoHostInputState, LEAVE_HANDOVER, LEAVE_RELEASE_ONLY, ProtoEvent,
@@ -77,6 +78,7 @@ pub(crate) enum CaptureType {
 
 #[derive(Debug)]
 enum CaptureRequest {
+    ReleaseClient(CaptureHandle, oneshot::Sender<bool>),
     /// release because the remote peer is taking over (they sent
     /// Enter+CursorPos). Skips the host-side warp so the peer's
     /// proportional CursorPos warp doesn't get clobbered by a
@@ -191,6 +193,21 @@ impl Capture {
         self.request_tx
             .send(CaptureRequest::Destroy(handle))
             .expect("channel closed");
+    }
+
+    pub(crate) async fn release_client(&self, handle: CaptureHandle) -> bool {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .request_tx
+            .send(CaptureRequest::ReleaseClient(handle, tx))
+            .is_err()
+        {
+            return false;
+        }
+        matches!(
+            tokio::time::timeout(Duration::from_secs(1), rx).await,
+            Ok(Ok(true))
+        )
     }
 
     pub(crate) fn release_for_handover(&self, completion: oneshot::Sender<bool>) {
@@ -650,6 +667,18 @@ struct PendingLeave {
     mode: u32,
 }
 
+fn effective_release_threshold(configured: u32, capabilities: u32, kcp: bool) -> u32 {
+    // Coalesced UDP displacement and OS pointer acceleration make the host's
+    // integrated cursor an estimate. Transactional peers return from their
+    // actual screen edge; that estimate must not preempt their ownership.
+    let required = CAP_UDP_MOTION_V1 | CAP_TRANSACTIONAL_HANDOVER;
+    if kcp && capabilities & required == required {
+        0
+    } else {
+        configured
+    }
+}
+
 fn negotiated_capture_session(
     handle: CaptureHandle,
     current_session: Option<ConnectionSession>,
@@ -807,6 +836,26 @@ impl CaptureTask {
             .is_some_and(|(peer, generation, _)| peer == handle && generation == session)
     }
 
+    async fn update_release_threshold(&self, capture: &mut InputCapture) {
+        let configured = *self.release_threshold_px.borrow();
+        let threshold = match (self.active_client, self.active_session) {
+            (Some(handle), Some(session)) => {
+                let capabilities = self
+                    .peer_capabilities
+                    .get(&(handle, session))
+                    .copied()
+                    .unwrap_or(0);
+                effective_release_threshold(
+                    configured,
+                    capabilities,
+                    self.conn.session_uses_kcp(handle, session).await,
+                )
+            }
+            _ => configured,
+        };
+        capture.set_release_threshold(threshold);
+    }
+
     async fn flush_pending_input(
         &mut self,
         handle: CaptureHandle,
@@ -952,6 +1001,7 @@ impl CaptureTask {
                             self.add_capture(h, p, t, command_as_ctrl, crossing_modifier)
                         }
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
+                        CaptureRequest::ReleaseClient(_, completion) => { let _ = completion.send(true); }
                         CaptureRequest::ReleaseForHandover(completion) => {
                             // No live capture backend means there is no local
                             // grab to order before the receiver's warp.
@@ -1098,11 +1148,16 @@ impl CaptureTask {
                     None => return Ok(()),
                 },
                 connection_event = self.conn.recv() => {
-                    let (handle, session, event) = match connection_event {
-                        MousehopConnectionEvent::Received { handle, session, event, .. } => {
-                            (handle, session, event)
+                    let (handle, session, event, receipt) = match connection_event {
+                        MousehopConnectionEvent::StateChanged { handle, .. } => {
+                            self.event_tx.send(ICaptureEvent::PeerCommitUpdated(handle)).expect("channel closed");
+                            continue;
+                        }
+                        MousehopConnectionEvent::Received { handle, session, event, receipt, .. } => {
+                            (handle, session, event, receipt)
                         }
                         MousehopConnectionEvent::Disconnected { handle, session } => {
+                            self.event_tx.send(ICaptureEvent::PeerCommitUpdated(handle)).expect("channel closed");
                             self.peer_capabilities.remove(&(handle, session));
                             self.pending_leaves.retain(|_, pending| {
                                 pending.handle != handle || pending.session != session
@@ -1124,6 +1179,8 @@ impl CaptureTask {
                             continue;
                         }
                     };
+                    'processing: {
+                        if receipt.as_ref().is_some_and(|r| !r.valid()) { break 'processing; }
                     if let Some(active) = self.active_client {
                         if handle != active
                             && !matches!(
@@ -1137,7 +1194,7 @@ impl CaptureTask {
                             // Capture events belong to the active client, but
                             // connection and recovery control-plane events can
                             // arrive from the retained recovery peer.
-                            continue
+                            break 'processing
                         }
                     }
 
@@ -1369,6 +1426,8 @@ impl CaptureTask {
                         }
                         _ => {}
                     }
+                    }
+                    if let Some(receipt) = receipt { receipt.complete(); }
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Reenable => {
@@ -1384,6 +1443,13 @@ impl CaptureTask {
                         // back with it.
                         log::info!("releasing capture: re-enable requested while active");
                         self.release_capture(capture).await?;
+                    },
+                    CaptureRequest::ReleaseClient(handle, completion) => {
+                        let result = if self.active_client == Some(handle) {
+                            self.release_capture(capture).await
+                        } else { Ok(()) };
+                        let _ = completion.send(result.is_ok());
+                        result?;
                     },
                     CaptureRequest::ReleaseForHandover(completion) => {
                         let result = self.release_capture_handover(capture).await;
@@ -1436,7 +1502,7 @@ impl CaptureTask {
                     }
                     CaptureRequest::SetReleaseThreshold(threshold) => {
                         *self.release_threshold_px.borrow_mut() = threshold;
-                        capture.set_release_threshold(threshold);
+                        self.update_release_threshold(capture).await;
                     }
                     CaptureRequest::SetCommandAsCtrl(handle, enabled) => {
                         self.set_command_as_ctrl(handle, enabled);
@@ -1542,6 +1608,14 @@ impl CaptureTask {
 
         if let CaptureEvent::HostInputState(state) = &event {
             return self.handle_host_input_state(capture, *state).await;
+        }
+
+        // The backend can already have entered a new capture while old input
+        // remains in its channel. Releasing again for an inactive handle can
+        // cancel that new capture before its Begin reaches this task.
+        if matches!(event, CaptureEvent::Input(_)) && self.active_client != Some(handle) {
+            log::debug!("discarding queued input from inactive capture {handle}");
+            return Ok(());
         }
 
         // A backend event already queued when the lock transition arrived can
@@ -1687,6 +1761,7 @@ impl CaptureTask {
             // operations, send_on_session rejects it rather than falling
             // through to the unnegotiated replacement.
             self.active_session = begin_session;
+            self.update_release_threshold(capture).await;
             if changed_client {
                 self.event_tx
                     .send(ICaptureEvent::ClientEntered(handle))
@@ -2164,7 +2239,12 @@ mod command_ctrl_tests {
             "mousehop-disconnect-test".to_owned(),
         ])
         .expect("test certificate");
-        let conn = MousehopConnection::new(cert, Default::default(), Default::default());
+        let conn = MousehopConnection::new(
+            cert,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
         let (event_tx, _event_rx) = channel();
         let (_request_tx, request_rx) = channel();
         CaptureTask {
@@ -2241,6 +2321,79 @@ mod command_ctrl_tests {
         assert!(task.pending_input.events.is_empty());
         assert!(!task.command_ctrl_mapper.enabled);
         assert!(task.peer_pressed_keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_input_after_release_does_not_cancel_a_new_crossing() {
+        let mut task = capture_task(None);
+        task.add_capture(7, Position::Right, CaptureType::Default, false, None);
+        *task.release_bind.borrow_mut() = vec![KeyLeftCtrl];
+        task.pending_cross = Some(PendingCross {
+            handle: 8,
+            begin: CaptureEvent::Begin {
+                cursor: None,
+                normalized_cursor: None,
+            },
+        });
+        let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy))
+            .await
+            .unwrap();
+        task.handle_accepted_capture_event(&mut capture, (7, CaptureEvent::Input(key(KeyA, 1))))
+            .await
+            .unwrap();
+        assert_eq!(task.pending_cross.as_ref().map(|p| p.handle), Some(8));
+        assert!(task.pending_input.events.is_empty());
+        assert!(task.active_client.is_none());
+    }
+
+    #[tokio::test]
+    async fn queued_input_from_previous_handle_does_not_touch_current_handover() {
+        let mut task = capture_task(Some(8));
+        task.add_capture(7, Position::Right, CaptureType::Default, false, None);
+        task.add_capture(8, Position::Top, CaptureType::Default, false, None);
+        *task.release_bind.borrow_mut() = vec![KeyLeftCtrl];
+        task.pending_handover = Some(PendingHandover {
+            handle: 8,
+            session: 11,
+            serial: 29,
+            enter: ProtoEvent::HandoverEnter {
+                serial: 29,
+                pos: mousehop_proto::Position::Bottom,
+                cross_fraction: None,
+            },
+            legacy_cursor: None,
+            transactional: true,
+        });
+        let mut capture = InputCapture::new(Some(input_capture::Backend::Dummy))
+            .await
+            .unwrap();
+        task.handle_accepted_capture_event(&mut capture, (7, CaptureEvent::Input(key(KeyA, 1))))
+            .await
+            .unwrap();
+        assert_eq!(task.active_client, Some(8));
+        assert_eq!(task.pending_handover.as_ref().map(|p| p.serial), Some(29));
+        assert!(task.pending_input.events.is_empty());
+        assert!(task.peer_pressed_keys.is_empty());
+    }
+
+    #[test]
+    fn hybrid_transactional_return_uses_receiver_edge_not_estimated_wall() {
+        let hybrid = CAP_UDP_MOTION_V1 | CAP_TRANSACTIONAL_HANDOVER;
+        for configured in [0, 1, 50, 500] {
+            assert_eq!(effective_release_threshold(configured, hybrid, true), 0);
+            assert_eq!(
+                effective_release_threshold(configured, hybrid, false),
+                configured
+            );
+            assert_eq!(
+                effective_release_threshold(configured, CAP_TRANSACTIONAL_HANDOVER, true),
+                configured
+            );
+            assert_eq!(
+                effective_release_threshold(configured, CAP_UDP_MOTION_V1, true),
+                configured
+            );
+        }
     }
 
     #[test]

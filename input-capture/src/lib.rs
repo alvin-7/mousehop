@@ -503,6 +503,11 @@ impl InputCapture {
     /// no need to recreate the backend.
     pub fn set_release_threshold(&mut self, threshold: u32) {
         self.release_threshold_px = threshold;
+        if threshold == 0 {
+            // Disabling must also cancel a previously armed fallback timer.
+            self.wall_press_pending = false;
+            self.wall_pressure = 0.0;
+        }
     }
 
     /// Cache the peer's display geometry for a position. Used by
@@ -1403,6 +1408,40 @@ async fn create(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn disabling_wall_fallback_cancels_an_already_armed_return() {
+        let mut capture = super::InputCapture::new(Some(super::Backend::Dummy))
+            .await
+            .unwrap();
+        capture.set_release_threshold(1);
+        capture.track_wall_press(
+            super::Position::Right,
+            &super::CaptureEvent::Begin {
+                cursor: None,
+                normalized_cursor: None,
+            },
+        );
+        let motion = super::CaptureEvent::Input(input_event::Event::Pointer(
+            input_event::PointerEvent::Motion {
+                time: 0,
+                dx: -10.0,
+                dy: 0.0,
+            },
+        ));
+        capture.track_wall_press(super::Position::Right, &motion);
+        assert!(capture.wall_press_pending);
+        capture.set_release_threshold(0);
+        assert!(!capture.wall_press_pending);
+        capture.track_wall_press(super::Position::Right, &motion);
+        assert!(!capture.wall_press_pending);
+        capture.set_release_threshold(1);
+        capture.track_wall_press(super::Position::Right, &motion);
+        assert!(
+            capture.wall_press_pending,
+            "legacy fallback can be restored"
+        );
+    }
+
     use super::{
         Backend, CaptureEvent, InputCapture, Position, model_topology_motion,
         normalize_cursor_in_layout, scale_motion, wrapping_generation_is_newer,

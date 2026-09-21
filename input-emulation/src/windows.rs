@@ -307,20 +307,28 @@ fn mouse_button(button: u32, state: u32) {
 }
 
 fn scroll(axis: u8, value: i32) {
-    let event_type = match axis {
-        0 => MOUSEEVENTF_WHEEL,
-        1 => MOUSEEVENTF_HWHEEL,
-        _ => return,
+    if let Some(input) = scroll_input(axis, value) {
+        send_mouse_input(input);
+    }
+}
+
+fn scroll_input(axis: u8, value: i32) -> Option<MOUSEINPUT> {
+    // Wire axes are positive down/right. Win32 wheel axes are positive
+    // up/right, so only vertical scrolling needs a sign conversion here.
+    // The per-peer natural-scroll preference has already been applied.
+    let (event_type, delta) = match axis {
+        0 => (MOUSEEVENTF_WHEEL, value.wrapping_neg()),
+        1 => (MOUSEEVENTF_HWHEEL, value),
+        _ => return None,
     };
-    let mi = MOUSEINPUT {
+    Some(MOUSEINPUT {
         dx: 0,
         dy: 0,
-        mouseData: -value as u32,
+        mouseData: delta as u32,
         dwFlags: event_type,
         time: 0,
         dwExtraInfo: 0,
-    };
-    send_mouse_input(mi);
+    })
 }
 
 fn key_event(key: u32, state: u8) {
@@ -369,7 +377,20 @@ fn linux_keycode_to_windows_scancode(linux_keycode: u32) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::union_to_screen;
+    use super::{MOUSEEVENTF_HWHEEL, MOUSEEVENTF_WHEEL, scroll_input, union_to_screen};
+
+    #[test]
+    fn scroll_axes_map_to_win32_up_and_right_conventions() {
+        for (value, vertical, horizontal) in [(120, -120, 120), (-120, 120, -120)] {
+            let y = scroll_input(0, value).unwrap();
+            let x = scroll_input(1, value).unwrap();
+            assert_eq!(y.dwFlags, MOUSEEVENTF_WHEEL);
+            assert_eq!(x.dwFlags, MOUSEEVENTF_HWHEEL);
+            assert_eq!(y.mouseData as i32, vertical);
+            assert_eq!(x.mouseData as i32, horizontal);
+        }
+        assert!(scroll_input(2, 120).is_none());
+    }
 
     #[test]
     fn union_to_screen_is_identity_when_the_primary_is_top_left() {

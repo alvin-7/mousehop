@@ -11,6 +11,68 @@ use super::ClientObject;
 const NO_HOSTNAME_MARKUP: &str =
     "<span font_style=\"italic\" font_weight=\"light\" foreground=\"darkgrey\">No Hostname</span>";
 
+#[cfg(test)]
+mod kcp_ui_tests {
+    use super::*;
+    use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    #[ignore = "requires a graphical desktop; run explicitly on the target OS"]
+    fn outgoing_kcp_widget_shows_actual_state_and_does_not_echo_server_updates() {
+        adw::init().expect("GTK desktop initialization");
+        gtk::gio::resources_register_include!("mousehop.gresource").unwrap();
+        let object = ClientObject::new(
+            7,
+            mousehop_ipc::ClientConfig::default(),
+            mousehop_ipc::ClientState::default(),
+        );
+        let row = ClientRow::new(&object);
+        row.bind(&object);
+        let count = Rc::new(Cell::new(0));
+        let seen = count.clone();
+        row.connect_local("request-use-kcp-change", false, move |_| {
+            seen.set(seen.get() + 1);
+            None
+        });
+        row.set_use_kcp(true);
+        assert!(row.imp().use_kcp_switch.is_active());
+        assert_eq!(
+            count.get(),
+            0,
+            "server update must not send a frontend request"
+        );
+        assert_eq!(
+            row.imp().kcp_row.subtitle().as_deref(),
+            Some("Disconnected")
+        );
+        object.set_transport_status("Negotiating");
+        assert_eq!(row.imp().kcp_row.subtitle().as_deref(), Some("Negotiating"));
+        object.set_transport_status("KCP");
+        assert_eq!(row.imp().kcp_row.subtitle().as_deref(), Some("KCP"));
+        row.imp().use_kcp_switch.set_active(false);
+        assert_eq!(count.get(), 1);
+        assert_eq!(
+            row.imp().kcp_row.subtitle().as_deref(),
+            Some("KCP"),
+            "preference is not session state"
+        );
+        assert!(!row.imp().scroll_inertia_switch.is_active());
+        let inertia_count = Rc::new(Cell::new(0));
+        let seen = inertia_count.clone();
+        row.connect_local("request-scroll-inertia-change", false, move |_| {
+            seen.set(seen.get() + 1);
+            None
+        });
+        row.set_scroll_inertia(true);
+        assert!(row.imp().scroll_inertia_switch.is_active());
+        assert_eq!(inertia_count.get(), 0, "server updates must not echo");
+        row.imp().scroll_inertia_switch.set_active(false);
+        assert_eq!(inertia_count.get(), 1);
+        assert!(!row.imp().scroll_inertia_switch.is_active());
+        row.unbind();
+    }
+}
+
 fn collapsed_title(hostname: Option<String>, port: u32) -> String {
     match hostname.as_deref() {
         Some(h) if !h.is_empty() => format!("{h}:{port}"),
@@ -215,6 +277,44 @@ impl ClientRow {
         bindings.push(clipboard_send_active_binding);
         bindings.push(command_as_ctrl_state_binding);
         bindings.push(command_as_ctrl_active_binding);
+        bindings.push(
+            client_object
+                .bind_property("use-kcp", &self.imp().use_kcp_switch.get(), "state")
+                .sync_create()
+                .build(),
+        );
+        bindings.push(
+            client_object
+                .bind_property(
+                    "scroll-inertia",
+                    &self.imp().scroll_inertia_switch.get(),
+                    "state",
+                )
+                .sync_create()
+                .build(),
+        );
+        bindings.push(
+            client_object
+                .bind_property("use-kcp", &self.imp().use_kcp_switch.get(), "active")
+                .sync_create()
+                .build(),
+        );
+        bindings.push(
+            client_object
+                .bind_property(
+                    "scroll-inertia",
+                    &self.imp().scroll_inertia_switch.get(),
+                    "active",
+                )
+                .sync_create()
+                .build(),
+        );
+        bindings.push(
+            client_object
+                .bind_property("transport-status", &self.imp().kcp_row.get(), "subtitle")
+                .sync_create()
+                .build(),
+        );
         bindings.push(require_crossing_modifier_state_binding);
         bindings.push(require_crossing_modifier_active_binding);
         bindings.push(crossing_modifier_sensitive_binding);
@@ -269,6 +369,14 @@ impl ClientRow {
 
     pub fn set_command_as_ctrl(&self, value: bool) {
         self.imp().set_command_as_ctrl(value);
+    }
+
+    pub fn set_use_kcp(&self, value: bool) {
+        self.imp().set_use_kcp(value);
+    }
+
+    pub fn set_scroll_inertia(&self, value: bool) {
+        self.imp().set_scroll_inertia(value);
     }
 
     pub fn set_crossing_modifier(&self, required: bool, modifier: CrossingModifier) {

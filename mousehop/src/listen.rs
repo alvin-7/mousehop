@@ -84,6 +84,7 @@ impl ListenerSessions {
 pub(crate) enum ListenEvent {
     Msg {
         event: ProtoEvent,
+        receipt: Option<crate::transport::Receipt>,
         addr: SocketAddr,
         session: ListenerSession,
     },
@@ -148,6 +149,7 @@ impl MousehopListener {
         port: u16,
         cert: Certificate,
         authorized_keys: Arc<RwLock<HashMap<String, IncomingPeerConfig>>>,
+        kcp_timeouts: crate::transport::Timeouts,
     ) -> Result<Self, ListenerCreationError> {
         let (listen_tx, listen_rx) = channel();
         let (request_port_change, request_port_change_rx) = channel();
@@ -219,6 +221,7 @@ impl MousehopListener {
                         conns.clone(),
                         sessions.clone(),
                         connection_attempts.clone(),
+                        kcp_timeouts,
                     );
                     listeners.insert(*ip, ListenerSlot { accept_task: task });
                     bound_count += 1;
@@ -239,6 +242,7 @@ impl MousehopListener {
                         conns.clone(),
                         sessions.clone(),
                         connection_attempts.clone(),
+                        kcp_timeouts,
                     );
                     listeners.insert(fallback, ListenerSlot { accept_task: task });
                     log::info!(
@@ -272,6 +276,7 @@ impl MousehopListener {
             request_port_change_rx,
             port_changed_tx,
             wake_rx,
+            kcp_timeouts,
         );
 
         Ok(Self {
@@ -363,7 +368,10 @@ impl MousehopListener {
             .filter(|slot| slot.session == session)
             .map(|slot| slot.conn.clone());
         if let Some(conn) = conn {
-            let conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
+            let conn: &DTLSConn = crate::transport::raw(&conn)
+                .as_any()
+                .downcast_ref()
+                .expect("dtls conn");
             let certs = conn.connection_state().await.peer_certificates;
             let cert = certs.first()?;
             let fingerprint = crypto::generate_fingerprint(cert);
@@ -474,6 +482,7 @@ fn spawn_accept_task(
     conns: Rc<AsyncMutex<HashMap<SocketAddr, AcceptedConnection>>>,
     sessions: ListenerSessions,
     connection_attempts: Arc<Mutex<VecDeque<String>>>,
+    kcp_timeouts: crate::transport::Timeouts,
 ) -> JoinHandle<()> {
     spawn_local(async move {
         loop {
@@ -484,6 +493,7 @@ fn spawn_accept_task(
                 c = listener.accept() => match c {
                     Ok((conn, addr)) => {
                         log::info!("dtls client connected, ip: {addr}");
+                        let conn = crate::transport::attach(conn, None, kcp_timeouts);
                         let session = sessions.allocate(addr);
                         let replaced = {
                             let mut conns_guard = conns.lock().await;
@@ -502,7 +512,7 @@ fn spawn_accept_task(
                             );
                             let _ = replaced.conn.close().await;
                         }
-                        let dtls_conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
+                        let dtls_conn: &DTLSConn = crate::transport::raw(&conn).as_any().downcast_ref().expect("dtls conn");
                         let certs = dtls_conn.connection_state().await.peer_certificates;
                         let cert = certs.first().expect("cert");
                         let fingerprint = crypto::generate_fingerprint(cert);
@@ -567,6 +577,7 @@ fn spawn_supervisor_task(
     mut request_port_change_rx: Receiver<u16>,
     port_changed_tx: Sender<Result<u16, ListenerCreationError>>,
     mut wake_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
+    kcp_timeouts: crate::transport::Timeouts,
 ) -> JoinHandle<()> {
     spawn_local(async move {
         let mut port = initial_port;
@@ -610,6 +621,7 @@ fn spawn_supervisor_task(
                         // `listeners.keys()` and we run single-
                         // threaded, so the remove always returns Some.
                         listeners.remove(&ip);
+                        close_reliable_connections(&conns, Some(ip)).await;
                         log::info!(
                             "reconcile: dropping stale listener on {ip}:{port} \
                              (IP no longer present on any interface)"
@@ -633,6 +645,7 @@ fn spawn_supervisor_task(
                                         conns.clone(),
                                         sessions.clone(),
                                         connection_attempts.clone(),
+                                        kcp_timeouts,
                                     );
                                     slot.insert(ListenerSlot { accept_task: task });
                                     log::info!(
@@ -664,6 +677,7 @@ fn spawn_supervisor_task(
                                         conns.clone(),
                                         sessions.clone(),
                                         connection_attempts.clone(),
+                                        kcp_timeouts,
                                     );
                                     listeners.insert(ip, ListenerSlot { accept_task: task });
                                     log::info!("interface up: now listening on {ip}:{port}");
@@ -674,6 +688,7 @@ fn spawn_supervisor_task(
                     }
                     Ok(if_watch::IfEvent::Down(net)) => {
                         let ip = net.addr();
+                        close_reliable_connections(&conns, Some(ip)).await;
                         if listeners.remove(&ip).is_some() {
                             log::info!("interface down: stopped listening on {ip}:{port}");
                         }
@@ -719,6 +734,7 @@ fn spawn_supervisor_task(
                 }
                 p = request_port_change_rx.recv() => {
                     let new_port = p.expect("channel closed");
+                    close_reliable_connections(&conns, None).await;
                     listeners.clear(); // Drop aborts each accept task
                     let mut bound = 0usize;
                     let addrs = enumerate_listenable_addrs();
@@ -731,6 +747,7 @@ fn spawn_supervisor_task(
                                     conns.clone(),
                                     sessions.clone(),
                                     connection_attempts.clone(),
+                                    kcp_timeouts,
                                 );
                                 listeners.insert(*ip, ListenerSlot { accept_task: task });
                                 bound += 1;
@@ -754,7 +771,8 @@ fn spawn_supervisor_task(
     })
 }
 
-/// Max silence on an accepted DTLS session before it's torn down.
+/// Max silence on a Legacy DTLS session before it's torn down.
+/// Established KCP sessions use the transport's configured peer/input deadlines.
 /// DTLS rides UDP, which carries no FIN — a peer that goes silent
 /// (asleep, network-partitioned, daemon killed) leaves an otherwise-
 /// blocked `recv` waiting forever, and the slot in `conns` becomes
@@ -794,6 +812,7 @@ async fn read_loop(
         let n = match tokio::time::timeout(RECV_IDLE_TIMEOUT, conn.recv(&mut b)).await {
             Ok(Ok(n)) => n,
             Ok(Err(_)) => break,
+            Err(_) if crate::transport::status(&conn) == "KCP" => continue,
             Err(_) => {
                 log::warn!(
                     "{addr}: no datagram in {RECV_IDLE_TIMEOUT:?} — closing stale connection"
@@ -809,6 +828,7 @@ async fn read_loop(
             log::debug!("ending replaced inbound DTLS read session {session} for {addr}");
             break;
         }
+        let receipt = crate::transport::receipt(&conn);
         let datagram = &b[..n];
         match decode_listen_datagram(datagram) {
             Some(event) if !handshake_allows_event(hello_ok.get(), &event) => {
@@ -829,6 +849,7 @@ async fn read_loop(
                 hello_ok.set(true);
                 dtls_tx
                     .send(ListenEvent::Msg {
+                        receipt,
                         event: ProtoEvent::Hello {
                             magic,
                             commit,
@@ -842,6 +863,7 @@ async fn read_loop(
             Some(event) => dtls_tx
                 .send(ListenEvent::Msg {
                     event,
+                    receipt,
                     addr,
                     session,
                 })
@@ -860,6 +882,7 @@ async fn read_loop(
             }
         }
     }
+    let _ = conn.close().await;
     log::info!("dtls client disconnected {addr:?}");
     let mut conns = conns.lock().await;
     // A peer can reconnect with the same UDP 4-tuple before the old
@@ -886,6 +909,23 @@ async fn accepted_connection_is_current(
         .await
         .get(&addr)
         .is_some_and(|slot| slot.session == session)
+}
+
+async fn close_reliable_connections(
+    conns: &AsyncMutex<HashMap<SocketAddr, AcceptedConnection>>,
+    local_ip: Option<IpAddr>,
+) {
+    let connections: Vec<_> = conns
+        .lock()
+        .await
+        .values()
+        .filter(|slot| !Arc::ptr_eq(crate::transport::raw(&slot.conn), &slot.conn))
+        .filter(|slot| local_ip.is_none_or(|ip| slot.conn.local_addr().is_ok_and(|a| a.ip() == ip)))
+        .map(|slot| slot.conn.clone())
+        .collect();
+    for conn in connections {
+        let _ = conn.close().await;
+    }
 }
 
 fn remove_connection_if_current(
@@ -942,6 +982,40 @@ fn decode_listen_datagram(bytes: &[u8]) -> Option<ProtoEvent> {
 mod tests {
     use super::*;
     use tokio::net::UdpSocket;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn udp_listener_survives_a_peer_closing_its_port() {
+        let listener = webrtc_util::conn::conn_udp_listener::listen("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener.addr().await.unwrap();
+        let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        first.send_to(b"first", addr).await.unwrap();
+        let (old, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(first);
+        // The reply reaches a closed port and Windows reports ICMP as 10054
+        // on the shared receive socket. A different peer must still connect.
+        old.send(b"reply after close").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let next = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        next.send_to(b"next", addr).await.unwrap();
+        let (accepted, peer) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .expect("shared UDP listener died after peer closed")
+            .unwrap();
+        assert_eq!(peer, next.local_addr().unwrap());
+        let mut bytes = [0; 16];
+        let len = tokio::time::timeout(Duration::from_secs(1), accepted.recv(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&bytes[..len], b"next");
+        listener.close().await.unwrap();
+    }
 
     async fn test_conn() -> ArcConn {
         Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("test socket"))

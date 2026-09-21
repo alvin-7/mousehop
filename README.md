@@ -611,3 +611,117 @@ The following sections detail the emulation and capture backends provided by mou
 - `windows`: Backend for input capture on Windows.
 - `macos`: Backend for input capture on MacOS.
 - `x11`: TODO (not yet supported)
+
+## Experimental reliable input over DTLS
+
+Expand a peer under **Outgoing Connections** and enable **Use KCP** on the controller.
+The receiver negotiates automatically; it needs a compatible build but no matching
+setting. The row shows the actual session state independently of the switch.
+Changing the switch saves `use_kcp` for that peer, releases its input and reconnects
+it without restarting the application. New configurations default to Legacy.
+An unsupported receiver causes an explicit failure, never silent fallback.
+The old top-level `input_transport` is only a migration default for peers without
+an explicit `use_kcp` value; it does not constrain incoming connections.
+With both peers on 0.17.7 or newer, pointer motion uses DTLS-encrypted UDP directly;
+keyboard, mouse buttons, scrolling and handover use KCP. Motion datagrams carry a
+sequence and cumulative displacement, so newer samples repair lost deltas and stale
+samples are ignored. Reliable events checkpoint preceding motion, preserving click
+and drag ordering. Motion following a critical event waits for that event to be
+delivered, but never enters the KCP retransmission queue itself. A lost final motion
+sample is repaired by the next motion or reliable event; it is not retransmitted.
+Older KCP peers retain the original all-reliable channel until both ends upgrade.
+Hello, heartbeat and clipboard remain direct. The hybrid envelope is separately
+versioned (v1, capability bit 5); existing KCP frame version 2 is unchanged.
+An input/consumption stall closes the session instead of replaying stale input.
+The optional top-level configuration below controls local KCP deadlines:
+
+```toml
+# Place before any [[clients]] or other TOML table.
+kcp_stall_timeout_ms = 300
+kcp_peer_timeout_ms = 1500
+```
+
+The input stall deadline defaults to 300 milliseconds. Peer liveness defaults to
+1500 milliseconds, allowing short idle network pauses without releasing control.
+Both accept integer values from 1 through 60000. Invalid values prevent startup
+with a configuration error. Restart Mousehop after editing these settings.
+They apply to every local KCP session, incoming and outgoing;
+configure and restart the controller and receiver separately. Raising only one
+side's timeout does not extend the other side's protection. Legacy is unaffected.
+Increasing the input deadline delays recovery from stalled input. Increasing the
+peer deadline delays cleanup after total silence, including release of already
+held keys/buttons. Very small values can expire before normal feedback (sent every
+50ms). No UI setting is added.
+Transient input bursts now wait for space in bounded KCP queues instead of
+disconnecting immediately; acknowledgements and sends are scheduled fairly.
+Stall warnings include queue ages and counters. Genuine input stalls still close
+the session using the configured timeout. On Windows, an ICMP port-unreachable
+from a restarted peer no longer terminates the shared UDP listener.
+The sender's stall timer measures lack of new contiguous **application consumption
+acknowledgements**, not the total age of a queued event. End-to-end latency may
+therefore exceed the timeout while consumption keeps advancing. Duplicate feedback
+and transport ACKs do not renew that timer; queue limits and receiver consumption
+deadlines still apply.
+KCP uses low-latency parameters `(nodelay=true, interval=10ms, resend=2, nc=true)`:
+congestion control is disabled for interactive LAN input. The 64/128 send/receive
+windows, application queue limits and consumption safeguards remain enabled.
+This can reduce queueing after loss, at the cost of more aggressive transmission;
+it cannot remove network jitter or reliable-channel head-of-line blocking.
+
+Warning/error diagnostics persist across ordinary app launches in
+`~/Library/Logs/Mousehop/connection-daemon.log` (Mac) or
+`%LOCALAPPDATA%/Mousehop/logs/connection-daemon.log` (Windows).
+Each role retains a current and previous log, rotating at 4 MiB.
+KCP support is experimental. Automated checks do not establish real-network
+latency or long-term stability across platforms.
+
+### Output congestion and UDP activity (0.17.8)
+
+Short DTLS writer congestion now applies bounded backpressure to reliable output.
+Cumulative UDP motion has a separate latest-sample slot; the single writer
+alternates between motion and reliable output when both are pending. Output
+deadlines retain their original queueing time across retries and transfers.
+The local `kcp_stall_timeout_ms` default remains 300 ms (range 1..=60000).
+
+Fresh negotiated UDP motion updates peer activity only after the session is
+ready. Duplicate, older or backward-dependency samples do not renew it.
+Future-dependent samples stay buffered; they start a missing-reliable-input
+deadline without renewing it. Motion never acknowledges reliable consumption
+or extends outstanding ACK, consumption or gap deadlines. Permanent write
+blocking and actual disconnection still close the session for normal cleanup.
+Simulated tests do not establish Mac/Windows or company Wi-Fi acceptance.
+
+For hybrid UDP-motion sessions with transactional handover, return to the
+controller is driven by the receiver's actual screen-edge crossing. The
+controller's estimated cursor position no longer triggers the wall-pressure
+fallback (`release_threshold_px`), since UDP coalescing and OS acceleration can
+make that estimate diverge. Legacy sessions retain the configured fallback.
+The release shortcut and transport-failure cleanup remain available; if the
+receiver cannot capture its screen edge, use the release shortcut to return.
+Capture-release reasons are also retained in the connection log.
+
+### Separate connection liveness (0.17.11)
+
+Fresh negotiated UDP motion, valid KCP traffic and authenticated Ping/Pong renew
+the independent `kcp_peer_timeout_ms` deadline. Heartbeats never acknowledge input
+consumption or renew outstanding input, consumption or missing-input deadlines.
+Established KCP sessions use this single liveness policy rather than the Legacy
+Ping/Pong and receive-idle watchdogs. Legacy watchdogs remain unchanged.
+Expiry logs distinguish peer silence from stalled reliable input and show both
+configured limits. There is no guarantee that a pause during pending critical
+input can survive the shorter input deadline.
+
+### Trackpad scroll inertia
+
+The receiving device's **Incoming Connections → Natural Scrolling** setting
+reverses both vertical and horizontal scrolling, including momentum scrolling.
+
+On the Mac controller, expand the Windows device under **Outgoing Connections**
+and enable **Scroll Inertia** to replay the Mac trackpad's momentum after lifting
+your fingers. It is off by default and saved per device as `scroll_inertia = true`
+inside that device's `[[clients]]` table. Both peers need this updated version.
+Changing the switch safely releases and reconnects only that device. The setting
+works with Legacy and KCP; it does not change pointer movement or synthesize a
+second inertia curve. Windows applications may still render wheel scrolling
+differently from native macOS applications. Existing Mac receiver behavior is
+unchanged.
