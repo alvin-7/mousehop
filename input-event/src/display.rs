@@ -210,6 +210,28 @@ pub struct DisplayLayout {
 }
 
 impl DisplayLayout {
+    /// Stable geometry fingerprint for authenticated recovery baselines. This
+    /// is a change detector, not a cryptographic identity or an authorization.
+    pub fn recovery_fingerprint(&self) -> u64 {
+        let mut rects: Vec<_> = self
+            .rectangles()
+            .map(|(_, r)| (r.x(), r.y(), r.width(), r.height()))
+            .collect();
+        rects.sort_unstable();
+        let mut hash = 0xcbf29ce484222325u64;
+        for (x, y, w, h) in rects {
+            for byte in x
+                .to_le_bytes()
+                .into_iter()
+                .chain(y.to_le_bytes())
+                .chain(w.to_le_bytes())
+                .chain(h.to_le_bytes())
+            {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+            }
+        }
+        hash.max(1)
+    }
     /// Builds a layout from `(x, y, width, height)` tuples.
     ///
     /// Empty rectangles and rectangles with overflowing exclusive ends are

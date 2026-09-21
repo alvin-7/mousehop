@@ -6,10 +6,11 @@ use input_event::{
 
 use async_trait::async_trait;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ops::BitOrAssign;
 use std::time::Duration;
-use tokio::task::AbortHandle;
+use tokio::task::JoinHandle;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
     MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
@@ -76,7 +77,7 @@ fn read_spi_u32(action: SYSTEM_PARAMETERS_INFO_ACTION) -> Option<u32> {
 }
 
 pub(crate) struct WindowsEmulation {
-    repeat_task: Option<AbortHandle>,
+    repeat_tasks: HashMap<EmulationHandle, JoinHandle<Result<(), EmulationError>>>,
     /// Cached virtual-screen origin, refreshed on each
     /// `display_bounds()` call — which the emulation proxy invokes
     /// at backend creation and then every 2s. `warp_cursor` reads
@@ -90,7 +91,7 @@ pub(crate) struct WindowsEmulation {
 impl WindowsEmulation {
     pub(crate) fn new() -> Result<Self, WindowsEmulationCreationError> {
         Ok(Self {
-            repeat_task: None,
+            repeat_tasks: HashMap::new(),
             virtual_screen_origin: Cell::new(None),
         })
     }
@@ -98,19 +99,23 @@ impl WindowsEmulation {
 
 #[async_trait]
 impl Emulation for WindowsEmulation {
-    async fn consume(&mut self, event: Event, _: EmulationHandle) -> Result<(), EmulationError> {
+    async fn consume(
+        &mut self,
+        event: Event,
+        handle: EmulationHandle,
+    ) -> Result<(), EmulationError> {
         match event {
             Event::Pointer(pointer_event) => match pointer_event {
                 PointerEvent::Motion { time: _, dx, dy } => {
-                    rel_mouse(dx as i32, dy as i32);
+                    rel_mouse(dx as i32, dy as i32)?;
                 }
                 PointerEvent::Button {
                     time: _,
                     button,
                     state,
-                } => mouse_button(button, state),
-                PointerEvent::Axis { axis, value, .. } => scroll(axis, value as i32),
-                PointerEvent::AxisDiscrete120 { axis, value } => scroll(axis, value),
+                } => mouse_button(button, state)?,
+                PointerEvent::Axis { axis, value, .. } => scroll(axis, value as i32)?,
+                PointerEvent::AxisDiscrete120 { axis, value } => scroll(axis, value)?,
             },
             Event::Keyboard(keyboard_event) => match keyboard_event {
                 KeyboardEvent::Key {
@@ -118,13 +123,18 @@ impl Emulation for WindowsEmulation {
                     key,
                     state,
                 } => {
-                    match state {
+                    let stopped = match state {
                         // pressed
-                        0 => self.kill_repeat_task(),
-                        1 => self.spawn_repeat_task(key).await,
-                        _ => {}
+                        0 | 1 => self.kill_repeat_task(handle).await,
+                        _ => Ok(()),
+                    };
+                    // Even a failed repeat must not prevent the key-up attempt.
+                    let injected = key_event(key, state);
+                    stopped?;
+                    injected?;
+                    if state == 1 {
+                        self.spawn_repeat_task(handle, key);
                     }
-                    key_event(key, state)
                 }
                 KeyboardEvent::Modifiers { .. } => {}
             },
@@ -133,15 +143,45 @@ impl Emulation for WindowsEmulation {
                 // platform `ClipboardEmulation` sink.
             }
         }
-        // FIXME
         Ok(())
     }
 
     async fn create(&mut self, _handle: EmulationHandle) {}
 
-    async fn destroy(&mut self, _handle: EmulationHandle) {}
+    async fn destroy(&mut self, handle: EmulationHandle) {
+        if let Err(error) = self.kill_repeat_task(handle).await {
+            log::warn!("repeat cleanup: {error}");
+        }
+    }
 
-    async fn terminate(&mut self) {}
+    async fn terminate(&mut self) {
+        for handle in self.repeat_tasks.keys().copied().collect::<Vec<_>>() {
+            self.destroy(handle).await;
+        }
+    }
+
+    async fn quiesce(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
+        self.kill_repeat_task(handle).await
+    }
+
+    fn recovery_baseline(&mut self) -> Result<super::RecoveryBaseline, EmulationError> {
+        use windows::Win32::{Foundation::POINT, UI::WindowsAndMessaging::GetCursorPos};
+        let mut point = POINT::default();
+        let (w, h) = self
+            .display_bounds()
+            .ok_or(EmulationError::DisplayTopologyUnavailable)?;
+        let (x, y) = self
+            .virtual_screen_origin
+            .get()
+            .ok_or(EmulationError::DisplayTopologyUnavailable)?;
+        let layout = input_event::display::DisplayLayout::new([(x, y, w, h)]);
+        unsafe { GetCursorPos(&mut point) }
+            .map_err(|e| EmulationError::Io(std::io::Error::other(e.to_string())))?;
+        Ok(super::RecoveryBaseline {
+            cursor: (point.x, point.y),
+            layout,
+        })
+    }
 
     fn display_bounds(&mut self) -> Option<(u32, u32)> {
         // Virtual-screen metrics cover the union of every monitor
@@ -211,54 +251,64 @@ fn union_to_screen(origin: (i32, i32), x: i32, y: i32) -> (i32, i32) {
 }
 
 impl WindowsEmulation {
-    async fn spawn_repeat_task(&mut self, key: u32) {
+    fn spawn_repeat_task(&mut self, handle: EmulationHandle, key: u32) {
         // there can only be one repeating key and it's
         // always the last to be pressed
-        self.kill_repeat_task();
         // Use the host's own keyboard repeat settings so forwarded keys
         // feel identical to typing directly on this machine.
         let (repeat_delay, repeat_interval) = read_key_repeat_settings();
         let repeat_task = tokio::task::spawn_local(async move {
             tokio::time::sleep(repeat_delay).await;
             loop {
-                key_event(key, 1);
+                key_event(key, 1)?;
                 tokio::time::sleep(repeat_interval).await;
             }
         });
-        self.repeat_task = Some(repeat_task.abort_handle());
+        self.repeat_tasks.insert(handle, repeat_task);
     }
-    fn kill_repeat_task(&mut self) {
-        if let Some(task) = self.repeat_task.take() {
+    async fn kill_repeat_task(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
+        if let Some(task) = self.repeat_tasks.remove(&handle) {
             task.abort();
-        }
-    }
-}
-
-fn send_input_safe(input: INPUT) {
-    unsafe {
-        loop {
-            /* retval = number of successfully submitted events */
-            if SendInput(&[input], std::mem::size_of::<INPUT>() as i32) > 0 {
-                break;
+            match task.await {
+                Ok(result) => result?,
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => return Err(EmulationError::BackgroundTask(error.to_string())),
             }
         }
+        Ok(())
     }
 }
 
-fn send_mouse_input(mi: MOUSEINPUT) {
+fn send_input_safe(input: INPUT) -> Result<(), EmulationError> {
+    submit_input(|| unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) })
+}
+
+fn submit_input(mut send: impl FnMut() -> u32) -> Result<(), EmulationError> {
+    // Exactly one event: no partially executed batch and no blind retry.
+    if send() == 1 {
+        Ok(())
+    } else {
+        Err(EmulationError::Io(std::io::Error::other(format!(
+            "SendInput rejected input (possibly UIPI): {}",
+            std::io::Error::last_os_error()
+        ))))
+    }
+}
+
+fn send_mouse_input(mi: MOUSEINPUT) -> Result<(), EmulationError> {
     send_input_safe(INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 { mi },
-    });
+    })
 }
 
-fn send_keyboard_input(ki: KEYBDINPUT) {
+fn send_keyboard_input(ki: KEYBDINPUT) -> Result<(), EmulationError> {
     send_input_safe(INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 { ki },
-    });
+    })
 }
-fn rel_mouse(dx: i32, dy: i32) {
+fn rel_mouse(dx: i32, dy: i32) -> Result<(), EmulationError> {
     let mi = MOUSEINPUT {
         dx,
         dy,
@@ -267,10 +317,10 @@ fn rel_mouse(dx: i32, dy: i32) {
         time: 0,
         dwExtraInfo: 0,
     };
-    send_mouse_input(mi);
+    send_mouse_input(mi)
 }
 
-fn mouse_button(button: u32, state: u32) {
+fn mouse_button(button: u32, state: u32) -> Result<(), EmulationError> {
     let dw_flags = match state {
         0 => match button {
             BTN_LEFT => MOUSEEVENTF_LEFTUP,
@@ -278,7 +328,7 @@ fn mouse_button(button: u32, state: u32) {
             BTN_MIDDLE => MOUSEEVENTF_MIDDLEUP,
             BTN_BACK => MOUSEEVENTF_XUP,
             BTN_FORWARD => MOUSEEVENTF_XUP,
-            _ => return,
+            _ => return Ok(()),
         },
         1 => match button {
             BTN_LEFT => MOUSEEVENTF_LEFTDOWN,
@@ -286,9 +336,9 @@ fn mouse_button(button: u32, state: u32) {
             BTN_MIDDLE => MOUSEEVENTF_MIDDLEDOWN,
             BTN_BACK => MOUSEEVENTF_XDOWN,
             BTN_FORWARD => MOUSEEVENTF_XDOWN,
-            _ => return,
+            _ => return Ok(()),
         },
-        _ => return,
+        _ => return Ok(()),
     };
     let mouse_data = match button {
         BTN_BACK => XBUTTON1 as u32,
@@ -303,30 +353,39 @@ fn mouse_button(button: u32, state: u32) {
         time: 0,
         dwExtraInfo: 0,
     };
-    send_mouse_input(mi);
+    send_mouse_input(mi)
 }
 
-fn scroll(axis: u8, value: i32) {
-    let event_type = match axis {
-        0 => MOUSEEVENTF_WHEEL,
-        1 => MOUSEEVENTF_HWHEEL,
-        _ => return,
+fn scroll(axis: u8, value: i32) -> Result<(), EmulationError> {
+    if let Some(input) = scroll_input(axis, value) {
+        send_mouse_input(input)?;
+    }
+    Ok(())
+}
+
+fn scroll_input(axis: u8, value: i32) -> Option<MOUSEINPUT> {
+    // Wire axes are positive down/right. Win32 wheel axes are positive
+    // up/right, so only vertical scrolling needs a sign conversion here.
+    // The per-peer natural-scroll preference has already been applied.
+    let (event_type, delta) = match axis {
+        0 => (MOUSEEVENTF_WHEEL, value.wrapping_neg()),
+        1 => (MOUSEEVENTF_HWHEEL, value),
+        _ => return None,
     };
-    let mi = MOUSEINPUT {
+    Some(MOUSEINPUT {
         dx: 0,
         dy: 0,
-        mouseData: -value as u32,
+        mouseData: delta as u32,
         dwFlags: event_type,
         time: 0,
         dwExtraInfo: 0,
-    };
-    send_mouse_input(mi);
+    })
 }
 
-fn key_event(key: u32, state: u8) {
+fn key_event(key: u32, state: u8) -> Result<(), EmulationError> {
     let scancode = match linux_keycode_to_windows_scancode(key) {
         Some(code) => code,
-        None => return,
+        None => return Ok(()),
     };
     let extended = scancode > 0xff;
     let scancode = scancode & 0xff;
@@ -344,7 +403,7 @@ fn key_event(key: u32, state: u8) {
         time: 0,
         dwExtraInfo: 0,
     };
-    send_keyboard_input(ki);
+    send_keyboard_input(ki)
 }
 
 fn linux_keycode_to_windows_scancode(linux_keycode: u32) -> Option<u16> {
@@ -369,7 +428,77 @@ fn linux_keycode_to_windows_scancode(linux_keycode: u32) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::union_to_screen;
+    #[test]
+    fn recovery_r1_2_send_input_failure_is_bounded_and_propagated() {
+        let mut calls = 0;
+        assert!(
+            super::submit_input(|| {
+                calls += 1;
+                0
+            })
+            .is_err()
+        );
+        assert_eq!(calls, 1);
+        assert!(super::submit_input(|| 1).is_ok());
+    }
+
+    #[tokio::test]
+    async fn recovery_r1_2_repeat_stop_joins_and_preserves_other_handle() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct Stopped(Arc<AtomicBool>);
+        impl Drop for Stopped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let mut backend = super::WindowsEmulation::new().unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let flag = stopped.clone();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = Stopped(flag);
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        backend.repeat_tasks.insert(1, task);
+        backend
+            .repeat_tasks
+            .insert(2, tokio::spawn(std::future::pending()));
+        started.await.unwrap();
+        backend.kill_repeat_task(1).await.unwrap();
+        assert!(stopped.load(Ordering::SeqCst));
+        assert!(!backend.repeat_tasks[&2].is_finished());
+        backend.kill_repeat_task(2).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_r1_2_repeat_failure_reaches_barrier() {
+        let mut backend = super::WindowsEmulation::new().unwrap();
+        let task = tokio::spawn(async { Err(super::EmulationError::EndOfStream) });
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        backend.repeat_tasks.insert(1, task);
+        assert!(backend.kill_repeat_task(1).await.is_err());
+    }
+    use super::{MOUSEEVENTF_HWHEEL, MOUSEEVENTF_WHEEL, scroll_input, union_to_screen};
+
+    #[test]
+    fn scroll_axes_map_to_win32_up_and_right_conventions() {
+        for (value, vertical, horizontal) in [(120, -120, 120), (-120, 120, -120)] {
+            let y = scroll_input(0, value).unwrap();
+            let x = scroll_input(1, value).unwrap();
+            assert_eq!(y.dwFlags, MOUSEEVENTF_WHEEL);
+            assert_eq!(x.dwFlags, MOUSEEVENTF_HWHEEL);
+            assert_eq!(y.mouseData as i32, vertical);
+            assert_eq!(x.mouseData as i32, horizontal);
+        }
+        assert!(scroll_input(2, 120).is_none());
+    }
 
     #[test]
     fn union_to_screen_is_identity_when_the_primary_is_top_left() {

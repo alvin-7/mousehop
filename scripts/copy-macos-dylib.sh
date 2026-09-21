@@ -138,7 +138,11 @@ copy_runtime_data() {
 
   if [ -d "$homebrew_path/share/glib-2.0/schemas" ]; then
     mkdir -p "$share_path/glib-2.0"
-    rm -rf "$share_path/glib-2.0/schemas"
+    if [ "${MOUSEHOP_FRESH_BUNDLE:-0}" = 1 ]; then
+      [ ! -e "$share_path/glib-2.0/schemas" ] || exit 1
+    else
+      rm -rf "$share_path/glib-2.0/schemas"
+    fi
     cp -RL "$homebrew_path/share/glib-2.0/schemas" "$share_path/glib-2.0/schemas"
     if command -v glib-compile-schemas >/dev/null 2>&1; then
       glib-compile-schemas "$share_path/glib-2.0/schemas"
@@ -148,13 +152,21 @@ copy_runtime_data() {
   fi
 
   if [ -d "$homebrew_path/share/gtk-4.0" ]; then
-    rm -rf "$share_path/gtk-4.0"
+    if [ "${MOUSEHOP_FRESH_BUNDLE:-0}" = 1 ]; then
+      [ ! -e "$share_path/gtk-4.0" ] || exit 1
+    else
+      rm -rf "$share_path/gtk-4.0"
+    fi
     cp -RL "$homebrew_path/share/gtk-4.0" "$share_path/gtk-4.0"
   fi
 
   if [ -d "$homebrew_path/share/icons/Adwaita" ]; then
     mkdir -p "$share_path/icons"
-    rm -rf "$share_path/icons/Adwaita"
+    if [ "${MOUSEHOP_FRESH_BUNDLE:-0}" = 1 ]; then
+      [ ! -e "$share_path/icons/Adwaita" ] || exit 1
+    else
+      rm -rf "$share_path/icons/Adwaita"
+    fi
     cp -RL "$homebrew_path/share/icons/Adwaita" "$share_path/icons/Adwaita"
   fi
 }
@@ -168,8 +180,13 @@ copy_runtime_data
 # pathForResource: only searches the Resources root (not arbitrary
 # subdirs), so flatten the file back to the root.
 if [ -f "$resources_path/_up_/target/menubar-template.png" ]; then
-  mv "$resources_path/_up_/target/menubar-template.png" "$resources_path/menubar-template.png"
-  rmdir "$resources_path/_up_/target" "$resources_path/_up_" 2>/dev/null || true
+  if [ "${MOUSEHOP_FRESH_BUNDLE:-0}" = 1 ]; then
+    [ ! -e "$resources_path/menubar-template.png" ] || exit 1
+    cp "$resources_path/_up_/target/menubar-template.png" "$resources_path/menubar-template.png"
+  else
+    mv "$resources_path/_up_/target/menubar-template.png" "$resources_path/menubar-template.png"
+    rmdir "$resources_path/_up_/target" "$resources_path/_up_" 2>/dev/null || true
+  fi
 fi
 
 # Ensure the main executable has our Frameworks path in its RPATH

@@ -22,5 +22,6 @@ pub mod macos_tcc_watch;
 mod network;
 pub mod panic_log;
 pub mod service;
+mod transport;
 #[cfg(windows)]
 pub mod windows_console;

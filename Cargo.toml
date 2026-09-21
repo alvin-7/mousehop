@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/webrtc-util"]
 members = [
     "input-capture",
     "input-emulation",
@@ -12,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.17.1"
+version = "0.17.12"
 
 [workspace.dependencies]
 input-event = { package = "mousehop-input-event", path = "input-event", version = "0.17.1" }
@@ -28,3 +29,6 @@ codegen-units = 1
 lto = "fat"
 strip = true
 panic = "abort"
+
+[patch.crates-io]
+webrtc-util = { path = "vendor/webrtc-util" }

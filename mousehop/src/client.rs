@@ -39,6 +39,8 @@ impl ClientManager {
             network_locks: config_client.network_locks,
             clipboard_send: config_client.clipboard_send,
             command_as_ctrl: config_client.command_as_ctrl,
+            use_kcp: config_client.use_kcp,
+            scroll_inertia: config_client.scroll_inertia,
             require_crossing_modifier: config_client.require_crossing_modifier,
             crossing_modifier: config_client.crossing_modifier,
         };
@@ -361,6 +363,32 @@ impl ClientManager {
 
     /// Update the macOS Command-to-Control alias for an outgoing
     /// client. Returns `true` only when the value changed.
+    pub(crate) fn set_use_kcp(&self, handle: ClientHandle, enabled: bool) -> bool {
+        match self.clients.borrow_mut().get_mut(handle as usize) {
+            Some((c, _)) if c.use_kcp != enabled => {
+                c.use_kcp = enabled;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn set_scroll_inertia(&self, handle: ClientHandle, enabled: bool) -> bool {
+        match self.clients.borrow_mut().get_mut(handle as usize) {
+            Some((c, _)) if c.scroll_inertia != enabled => {
+                c.scroll_inertia = enabled;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn set_transport_status(&self, handle: ClientHandle, status: &str) {
+        if let Some((_, state)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            state.transport_status = status.to_owned();
+        }
+    }
+
     pub(crate) fn set_command_as_ctrl(&self, handle: ClientHandle, enabled: bool) -> bool {
         match self.clients.borrow_mut().get_mut(handle as usize) {
             Some((c, _)) if c.command_as_ctrl != enabled => {
@@ -662,6 +690,8 @@ mod tests {
             network_locks: HashMap::new(),
             clipboard_send: false,
             command_as_ctrl: false,
+            use_kcp: false,
+            scroll_inertia: false,
             require_crossing_modifier: false,
             crossing_modifier: CrossingModifier::default(),
         });
@@ -774,6 +804,22 @@ mod tests {
         assert!(!cm.set_command_as_ctrl(h, true));
         assert!(cm.set_command_as_ctrl(h, false));
         assert!(!cm.command_as_ctrl(h));
+    }
+
+    #[test]
+    fn outgoing_transport_preferences_and_status_are_per_peer() {
+        let cm = ClientManager::default();
+        let a = cm.add_client();
+        let b = cm.add_client();
+        assert!(cm.set_use_kcp(a, true));
+        assert!(!cm.set_use_kcp(a, true));
+        cm.set_transport_status(a, "KCP");
+        cm.set_transport_status(b, "Legacy");
+        assert!(cm.get_state(a).unwrap().0.use_kcp);
+        assert!(!cm.get_state(b).unwrap().0.use_kcp);
+        assert!(cm.set_use_kcp(a, false));
+        assert_eq!(cm.get_state(b).unwrap().1.transport_status, "Legacy");
+        assert!(!cm.set_use_kcp(u64::MAX, true));
     }
 
     #[test]
