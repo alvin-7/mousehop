@@ -98,11 +98,16 @@ pub(crate) enum MousehopConnectionError {
 /// send cleanup events over (and potentially reconnect) the dead session.
 #[derive(Debug)]
 pub(crate) enum MousehopConnectionEvent {
+    StateChanged {
+        handle: ClientHandle,
+        session: ConnectionSession,
+    },
     Received {
         handle: ClientHandle,
         addr: SocketAddr,
         session: ConnectionSession,
         event: ProtoEvent,
+        receipt: Option<crate::transport::Receipt>,
     },
     Disconnected {
         handle: ClientHandle,
@@ -293,6 +298,7 @@ async fn connect_any(
 }
 
 pub(crate) struct MousehopConnection {
+    kcp_stall_timeout: crate::transport::StallTimeout,
     cert: Certificate,
     client_manager: ClientManager,
     conns: Rc<Mutex<HashMap<SocketAddr, ConnectionSlot>>>,
@@ -330,10 +336,12 @@ impl MousehopConnection {
         cert: Certificate,
         client_manager: ClientManager,
         primary_hints: PrimaryCache,
+        kcp_stall_timeout: crate::transport::StallTimeout,
     ) -> Self {
         let (recv_tx, recv_rx) = channel();
         Self {
             cert,
+            kcp_stall_timeout,
             client_manager,
             conns: Default::default(),
             sessions: Default::default(),
@@ -365,7 +373,8 @@ impl MousehopConnection {
                     }
                     MousehopConnectionEvent::Disconnected {
                         handle, session, ..
-                    } => self
+                    }
+                    | MousehopConnectionEvent::StateChanged { handle, session } => self
                         .sessions
                         .current(*handle)
                         .is_none_or(|current| current == *session),
@@ -394,6 +403,7 @@ impl MousehopConnection {
         let (_, dead_rx) = channel();
         Self {
             cert: self.cert.clone(),
+            kcp_stall_timeout: self.kcp_stall_timeout,
             client_manager: self.client_manager.clone(),
             conns: self.conns.clone(),
             sessions: self.sessions.clone(),
@@ -461,6 +471,9 @@ impl MousehopConnection {
                 if !self.client_manager.alive(handle) && !send_when_emulation_inactive {
                     return Err(MousehopConnectionError::TargetEmulationDisabled);
                 }
+                if !crate::transport::ready(&slot.conn) {
+                    return Err(MousehopConnectionError::NotConnected);
+                }
                 match slot.conn.send(buf).await {
                     Ok(_) => {}
                     Err(e) => {
@@ -517,6 +530,7 @@ impl MousehopConnection {
                 self.ping_sent_at.clone(),
                 self.primary_hints.clone(),
                 self.retry_state.clone(),
+                self.kcp_stall_timeout,
             ));
         }
         Err(MousehopConnectionError::NotConnected)
@@ -584,6 +598,9 @@ impl MousehopConnection {
         }
         if !self.client_manager.alive(handle) && !send_when_emulation_inactive && !session_cleanup {
             return Err(MousehopConnectionError::TargetEmulationDisabled);
+        }
+        if !crate::transport::ready(&slot.conn) {
+            return Err(MousehopConnectionError::NotConnected);
         }
         if let Err(e) = slot.conn.send(buf).await {
             log::warn!("client {handle} session {session} failed to send: {e}");
@@ -714,8 +731,14 @@ async fn connect_to_handle(
     ping_sent_at: Rc<RefCell<HashMap<(SocketAddr, ConnectionSession), Instant>>>,
     primary_hints: PrimaryCache,
     retry_state: Rc<RefCell<HashMap<ClientHandle, RetryState>>>,
+    kcp_stall_timeout: crate::transport::StallTimeout,
 ) -> Result<(), MousehopConnectionError> {
     log::info!("client {handle} connecting ...");
+    if !sessions.is_current(handle, session) || client_manager.get_state(handle).is_none() {
+        return Err(MousehopConnectionError::NotConnected);
+    }
+    client_manager.set_transport_status(handle, "Negotiating");
+    let _ = tx.send(MousehopConnectionEvent::StateChanged { handle, session });
     // sending did not work, figure out active conn.
     if let Some(ips_set) = client_manager.get_ips(handle) {
         let port = client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
@@ -766,6 +789,10 @@ async fn connect_to_handle(
             // event — `should_attempt` will keep gating until either
             // the backoff elapses or new info arrives.
             record_retry_failure(&retry_state, handle, &ips_set, primary_ip);
+            if sessions.is_current(handle, session) {
+                client_manager.set_transport_status(handle, "Failed: no peer address");
+                let _ = tx.send(MousehopConnectionEvent::StateChanged { handle, session });
+            }
             finish_failed_dial(&connecting, &sessions, handle, session).await;
             return Err(MousehopConnectionError::NotConnected);
         }
@@ -773,6 +800,10 @@ async fn connect_to_handle(
         let (conn, addr) = match res {
             Ok(c) => c,
             Err(e) => {
+                if sessions.is_current(handle, session) {
+                    client_manager.set_transport_status(handle, &format!("Failed: {e}"));
+                    let _ = tx.send(MousehopConnectionEvent::StateChanged { handle, session });
+                }
                 record_retry_failure(&retry_state, handle, &ips_set, primary_ip);
                 finish_failed_dial(&connecting, &sessions, handle, session).await;
                 return Err(e);
@@ -788,6 +819,15 @@ async fn connect_to_handle(
             );
             return Err(MousehopConnectionError::NotConnected);
         }
+        let use_kcp = client_manager
+            .get_state(handle)
+            .is_some_and(|(c, _)| c.use_kcp);
+        let mode = if use_kcp {
+            crate::transport::InputTransport::KcpRequired
+        } else {
+            crate::transport::InputTransport::Legacy
+        };
+        let conn = crate::transport::attach(conn, Some(mode), kcp_stall_timeout);
         log::info!("client ({handle}) connected @ {addr}");
         // `alive` belongs to the authenticated protocol session, not merely
         // this client handle. A reconnect can otherwise inherit `true` from
@@ -837,7 +877,15 @@ async fn connect_to_handle(
         // echoed Hello validates; `hello_handshake` retransmits until
         // then and tears the connection down if the window elapses.
         let hello_ok = Rc::new(Cell::new(false));
-        spawn_local(hello_handshake(addr, conn.clone(), hello_ok.clone()));
+        let scroll_inertia = client_manager
+            .get_state(handle)
+            .is_some_and(|(config, _)| config.scroll_inertia);
+        spawn_local(hello_handshake(
+            addr,
+            conn.clone(),
+            hello_ok.clone(),
+            scroll_inertia,
+        ));
 
         // poll connection for active
         spawn_local(ping_pong(
@@ -893,8 +941,15 @@ async fn hello_handshake(
     addr: SocketAddr,
     conn: Arc<dyn Conn + Send + Sync>,
     hello_ok: Rc<Cell<bool>>,
+    scroll_inertia: bool,
 ) {
-    let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::hello(local_commit()).into();
+    let mut hello = ProtoEvent::hello(local_commit());
+    if let ProtoEvent::Hello { capabilities, .. } = &mut hello {
+        if scroll_inertia {
+            *capabilities |= mousehop_proto::CAP_SCROLL_INERTIA_REQUEST;
+        }
+    }
+    let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = hello.into();
     for _ in 0..HELLO_MAX_ATTEMPTS {
         if hello_ok.get() {
             return;
@@ -1038,6 +1093,7 @@ async fn receive_loop(
         if n == 0 {
             continue;
         }
+        let receipt = crate::transport::receipt(&conn);
         let datagram = &buf[..n];
         let event = match decode_proto_datagram(datagram) {
             Some(event) => event,
@@ -1064,7 +1120,19 @@ async fn receive_loop(
         match event {
             ProtoEvent::Pong(b) => {
                 client_manager.set_active_addr(handle, Some(addr));
-                client_manager.set_alive(handle, b);
+                client_manager.set_alive(handle, b && crate::transport::ready(&conn));
+                let status = if b {
+                    crate::transport::status(&conn)
+                } else {
+                    "Negotiating".to_owned()
+                };
+                if client_manager
+                    .get_state(handle)
+                    .is_some_and(|(_, s)| s.transport_status != status)
+                {
+                    client_manager.set_transport_status(handle, &status);
+                    let _ = tx.send(MousehopConnectionEvent::StateChanged { handle, session });
+                }
                 ping_response.borrow_mut().insert((addr, session));
                 // Live RTT of the active connection over the real DTLS
                 // path — accurate and firewall-proof (unlike the TCP
@@ -1100,6 +1168,7 @@ async fn receive_loop(
                     handle,
                     addr,
                     session,
+                    receipt,
                     event: ProtoEvent::Hello {
                         magic,
                         commit,
@@ -1114,11 +1183,23 @@ async fn receive_loop(
                     addr,
                     session,
                     event,
+                    receipt,
                 })
                 .expect("channel closed"),
         }
     }
     log::debug!("{addr}: receive loop ended");
+    if connection_is_current(&conns, &sessions, handle, addr, session).await {
+        let status = crate::transport::status(&conn);
+        client_manager.set_transport_status(
+            handle,
+            if status.starts_with("Failed:") {
+                &status
+            } else {
+                "Disconnected"
+            },
+        );
+    }
     disconnect(
         &client_manager,
         handle,
@@ -1201,6 +1282,15 @@ async fn disconnect(
         && (manager_removed || client_manager.active_addr(handle) == Some(addr))
     {
         if !manager_removed {
+            let status = removed.as_ref().map(crate::transport::status);
+            if let Some(status) = status.filter(|s| s.starts_with("Failed:")) {
+                client_manager.set_transport_status(handle, &status);
+            } else if !client_manager
+                .get_state(handle)
+                .is_some_and(|(_, s)| s.transport_status.starts_with("Failed:"))
+            {
+                client_manager.set_transport_status(handle, "Disconnected");
+            }
             client_manager.set_alive(handle, false);
             client_manager.set_active_addr(handle, None);
             client_manager.set_peer_commit(handle, None);
@@ -1580,8 +1670,12 @@ mod tests {
         let handle = client_manager.add_client();
         let cert = Certificate::generate_self_signed(["mousehop-dial-reset-test".to_owned()])
             .expect("test certificate");
-        let connection =
-            MousehopConnection::new(cert, client_manager.clone(), PrimaryCache::default());
+        let connection = MousehopConnection::new(
+            cert,
+            client_manager.clone(),
+            PrimaryCache::default(),
+            Default::default(),
+        );
         let session = connection.sessions.allocate(handle);
         connection.connecting.lock().await.insert(handle, session);
 
@@ -1616,8 +1710,12 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:4242".parse().expect("test address");
         let cert = Certificate::generate_self_signed(["mousehop-session-send-test".to_owned()])
             .expect("test certificate");
-        let connection =
-            MousehopConnection::new(cert, client_manager.clone(), PrimaryCache::default());
+        let connection = MousehopConnection::new(
+            cert,
+            client_manager.clone(),
+            PrimaryCache::default(),
+            Default::default(),
+        );
         let old_session = connection.sessions.allocate(handle);
         let replacement_session = connection.sessions.allocate(handle);
         connection.conns.lock().await.insert(
@@ -1649,8 +1747,12 @@ mod tests {
         let handle = client_manager.add_client();
         let cert = Certificate::generate_self_signed(["mousehop-release-cleanup-test".to_owned()])
             .expect("test certificate");
-        let connection =
-            MousehopConnection::new(cert, client_manager.clone(), PrimaryCache::default());
+        let connection = MousehopConnection::new(
+            cert,
+            client_manager.clone(),
+            PrimaryCache::default(),
+            Default::default(),
+        );
         let session = connection.sessions.allocate(handle);
         let (conn, receiver, addr) = connected_test_conn().await;
         connection.conns.lock().await.insert(

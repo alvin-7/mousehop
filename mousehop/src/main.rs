@@ -54,9 +54,28 @@ fn main() {
     #[cfg(windows)]
     mousehop::windows_console::attach_parent();
 
-    // init logging
+    let role = if std::env::args().skip(1).any(|a| a == "daemon") {
+        "daemon"
+    } else {
+        "gui"
+    };
     let env = Env::default().filter_or("MOUSEHOP_LOG_LEVEL", "info");
-    env_logger::init_from_env(env);
+    env_logger::Builder::from_env(env)
+        .format(move |buf, record| {
+            use std::io::Write;
+            let message = format!(
+                "[{} {:<5} {}] {}",
+                buf.timestamp(),
+                record.level(),
+                record.target(),
+                record.args()
+            );
+            if record.level() <= log::Level::Warn {
+                mousehop::panic_log::record_warning(role, &message);
+            }
+            writeln!(buf, "{message}")
+        })
+        .init();
 
     // Route panics to a durable logfile before anything else can run.
     // The daemon child's stderr is /dev/null under LaunchServices, so
@@ -65,11 +84,6 @@ fn main() {
     // see — which is exactly why the screensaver-lockup crash went
     // undiagnosed. Tag each record by role so a shared log file stays
     // attributable.
-    let role = if std::env::args().skip(1).any(|a| a == "daemon") {
-        "daemon"
-    } else {
-        "gui"
-    };
     mousehop::panic_log::install(role);
 
     // On a Linux `cargo install` (no AUR / Flatpak / distro package)

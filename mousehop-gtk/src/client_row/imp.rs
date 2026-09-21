@@ -19,6 +19,12 @@ pub struct ClientRow {
     #[template_child]
     pub clipboard_send_switch: TemplateChild<gtk::Switch>,
     #[template_child]
+    pub use_kcp_switch: TemplateChild<gtk::Switch>,
+    #[template_child]
+    pub scroll_inertia_switch: TemplateChild<gtk::Switch>,
+    #[template_child]
+    pub kcp_row: TemplateChild<ActionRow>,
+    #[template_child]
     pub command_as_ctrl_row: TemplateChild<ActionRow>,
     #[template_child]
     pub command_as_ctrl_switch: TemplateChild<gtk::Switch>,
@@ -50,6 +56,8 @@ pub struct ClientRow {
     set_state_handler: RefCell<Option<SignalHandlerId>>,
     pub clipboard_send_handler: RefCell<Option<SignalHandlerId>>,
     pub command_as_ctrl_handler: RefCell<Option<SignalHandlerId>>,
+    pub use_kcp_handler: RefCell<Option<SignalHandlerId>>,
+    pub scroll_inertia_handler: RefCell<Option<SignalHandlerId>>,
     pub require_crossing_modifier_handler: RefCell<Option<SignalHandlerId>>,
     pub crossing_modifier_handler: RefCell<Option<SignalHandlerId>>,
     address_select_handler: RefCell<Option<SignalHandlerId>>,
@@ -158,6 +166,30 @@ impl ObjectImpl for ClientRow {
             }
         ));
         self.command_as_ctrl_handler.replace(Some(handler));
+        let handler = self.use_kcp_switch.connect_state_set(clone!(
+            #[weak(rename_to = row)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, state| {
+                row.obj()
+                    .emit_by_name::<()>("request-use-kcp-change", &[&state]);
+                glib::Propagation::Proceed
+            }
+        ));
+        self.use_kcp_handler.replace(Some(handler));
+        let handler = self.scroll_inertia_switch.connect_state_set(clone!(
+            #[weak(rename_to = row)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, state| {
+                row.obj()
+                    .emit_by_name::<()>("request-scroll-inertia-change", &[&state]);
+                glib::Propagation::Proceed
+            }
+        ));
+        self.scroll_inertia_handler.replace(Some(handler));
         let handler = self
             .require_crossing_modifier_switch
             .connect_state_set(clone!(
@@ -235,6 +267,12 @@ impl ObjectImpl for ClientRow {
                     .param_types([u32::static_type()])
                     .build(),
                 Signal::builder("request-clipboard-send-change")
+                    .param_types([bool::static_type()])
+                    .build(),
+                Signal::builder("request-use-kcp-change")
+                    .param_types([bool::static_type()])
+                    .build(),
+                Signal::builder("request-scroll-inertia-change")
                     .param_types([bool::static_type()])
                     .build(),
                 Signal::builder("request-command-as-ctrl-change")
@@ -379,6 +417,30 @@ impl ClientRow {
             .expect("client object")
             .set_command_as_ctrl(value);
         self.command_as_ctrl_switch.unblock_signal(handler);
+    }
+
+    pub(super) fn set_use_kcp(&self, value: bool) {
+        let handler = self.use_kcp_handler.borrow();
+        let handler = handler.as_ref().expect("signal handler");
+        self.use_kcp_switch.block_signal(handler);
+        self.client_object
+            .borrow()
+            .as_ref()
+            .expect("client object")
+            .set_use_kcp(value);
+        self.use_kcp_switch.unblock_signal(handler);
+    }
+
+    pub(super) fn set_scroll_inertia(&self, value: bool) {
+        let handler = self.scroll_inertia_handler.borrow();
+        let handler = handler.as_ref().expect("signal handler");
+        self.scroll_inertia_switch.block_signal(handler);
+        self.client_object
+            .borrow()
+            .as_ref()
+            .expect("client object")
+            .set_scroll_inertia(value);
+        self.scroll_inertia_switch.unblock_signal(handler);
     }
 
     /// Push the daemon's crossing-gate settings into both controls without

@@ -45,9 +45,8 @@ pub enum PointerEvent {
     ///
     /// `momentum` is `true` for the source OS's synthesised momentum-coast
     /// deltas (macOS keeps emitting these after the finger lifts). A sink that
-    /// doesn't replay OS momentum for injected scroll (everything but a macOS
-    /// sink) drops them, so a forwarded macOS coast doesn't pin a cohort app's
-    /// gap-inference kinetic scroll. Always `false` off macOS sources.
+    /// doesn't replay OS momentum by default drops them unless the controller
+    /// opts in to scroll inertia. Always `false` off macOS sources.
     Axis {
         time: u32,
         axis: u8,

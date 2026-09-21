@@ -1974,6 +1974,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcp"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9be8f8058681ab8b7e4959a1ee88a4446f43b7c787f174d9d1b32ba493737a59"
+dependencies = [
+ "bytes",
+ "log",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "keycode"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2240,8 +2251,9 @@ dependencies = [
 
 [[package]]
 name = "mousehop"
-version = "0.17.1"
+version = "0.17.9"
 dependencies = [
+ "async-trait",
  "clap 4.6.0",
  "core-graphics",
  "env_logger",
@@ -2249,6 +2261,7 @@ dependencies = [
  "hostname",
  "if-addrs 0.13.4",
  "if-watch",
+ "kcp",
  "libc",
  "local-channel",
  "log",
@@ -2281,7 +2294,7 @@ dependencies = [
 
 [[package]]
 name = "mousehop-cli"
-version = "0.17.1"
+version = "0.17.9"
 dependencies = [
  "clap 4.6.0",
  "futures",
@@ -2292,7 +2305,7 @@ dependencies = [
 
 [[package]]
 name = "mousehop-gtk"
-version = "0.17.1"
+version = "0.17.9"
 dependencies = [
  "async-channel",
  "glib-build-tools",
@@ -2310,7 +2323,7 @@ dependencies = [
 
 [[package]]
 name = "mousehop-input-capture"
-version = "0.17.1"
+version = "0.17.9"
 dependencies = [
  "arboard",
  "ashpd",
@@ -2347,7 +2360,7 @@ dependencies = [
 
 [[package]]
 name = "mousehop-input-emulation"
-version = "0.17.1"
+version = "0.17.9"
 dependencies = [
  "arboard",
  "ashpd",
@@ -2374,7 +2387,7 @@ dependencies = [
 
 [[package]]
 name = "mousehop-input-event"
-version = "0.17.1"
+version = "0.17.9"
 dependencies = [
  "futures-core",
  "log",
@@ -2386,7 +2399,7 @@ dependencies = [
 
 [[package]]
 name = "mousehop-ipc"
-version = "0.17.1"
+version = "0.17.9"
 dependencies = [
  "futures",
  "log",
@@ -2400,7 +2413,7 @@ dependencies = [
 
 [[package]]
 name = "mousehop-proto"
-version = "0.17.1"
+version = "0.17.9"
 dependencies = [
  "mousehop-input-event",
  "num_enum",
@@ -4409,8 +4422,6 @@ dependencies = [
 [[package]]
 name = "webrtc-util"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64bfb10dbe6d762f80169ae07cf252bafa1f764b9594d140008a0231c0cdce58"
 dependencies = [
  "async-trait",
  "bitflags 1.3.2",

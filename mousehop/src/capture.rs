@@ -77,6 +77,7 @@ pub(crate) enum CaptureType {
 
 #[derive(Debug)]
 enum CaptureRequest {
+    ReleaseClient(CaptureHandle, oneshot::Sender<bool>),
     /// release because the remote peer is taking over (they sent
     /// Enter+CursorPos). Skips the host-side warp so the peer's
     /// proportional CursorPos warp doesn't get clobbered by a
@@ -191,6 +192,21 @@ impl Capture {
         self.request_tx
             .send(CaptureRequest::Destroy(handle))
             .expect("channel closed");
+    }
+
+    pub(crate) async fn release_client(&self, handle: CaptureHandle) -> bool {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .request_tx
+            .send(CaptureRequest::ReleaseClient(handle, tx))
+            .is_err()
+        {
+            return false;
+        }
+        matches!(
+            tokio::time::timeout(Duration::from_secs(1), rx).await,
+            Ok(Ok(true))
+        )
     }
 
     pub(crate) fn release_for_handover(&self, completion: oneshot::Sender<bool>) {
@@ -952,6 +968,7 @@ impl CaptureTask {
                             self.add_capture(h, p, t, command_as_ctrl, crossing_modifier)
                         }
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
+                        CaptureRequest::ReleaseClient(_, completion) => { let _ = completion.send(true); }
                         CaptureRequest::ReleaseForHandover(completion) => {
                             // No live capture backend means there is no local
                             // grab to order before the receiver's warp.
@@ -1098,11 +1115,16 @@ impl CaptureTask {
                     None => return Ok(()),
                 },
                 connection_event = self.conn.recv() => {
-                    let (handle, session, event) = match connection_event {
-                        MousehopConnectionEvent::Received { handle, session, event, .. } => {
-                            (handle, session, event)
+                    let (handle, session, event, receipt) = match connection_event {
+                        MousehopConnectionEvent::StateChanged { handle, .. } => {
+                            self.event_tx.send(ICaptureEvent::PeerCommitUpdated(handle)).expect("channel closed");
+                            continue;
+                        }
+                        MousehopConnectionEvent::Received { handle, session, event, receipt, .. } => {
+                            (handle, session, event, receipt)
                         }
                         MousehopConnectionEvent::Disconnected { handle, session } => {
+                            self.event_tx.send(ICaptureEvent::PeerCommitUpdated(handle)).expect("channel closed");
                             self.peer_capabilities.remove(&(handle, session));
                             self.pending_leaves.retain(|_, pending| {
                                 pending.handle != handle || pending.session != session
@@ -1124,6 +1146,8 @@ impl CaptureTask {
                             continue;
                         }
                     };
+                    'processing: {
+                        if receipt.as_ref().is_some_and(|r| !r.valid()) { break 'processing; }
                     if let Some(active) = self.active_client {
                         if handle != active
                             && !matches!(
@@ -1137,7 +1161,7 @@ impl CaptureTask {
                             // Capture events belong to the active client, but
                             // connection and recovery control-plane events can
                             // arrive from the retained recovery peer.
-                            continue
+                            break 'processing
                         }
                     }
 
@@ -1369,6 +1393,8 @@ impl CaptureTask {
                         }
                         _ => {}
                     }
+                    }
+                    if let Some(receipt) = receipt { receipt.complete(); }
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Reenable => {
@@ -1384,6 +1410,13 @@ impl CaptureTask {
                         // back with it.
                         log::info!("releasing capture: re-enable requested while active");
                         self.release_capture(capture).await?;
+                    },
+                    CaptureRequest::ReleaseClient(handle, completion) => {
+                        let result = if self.active_client == Some(handle) {
+                            self.release_capture(capture).await
+                        } else { Ok(()) };
+                        let _ = completion.send(result.is_ok());
+                        result?;
                     },
                     CaptureRequest::ReleaseForHandover(completion) => {
                         let result = self.release_capture_handover(capture).await;
@@ -2164,7 +2197,12 @@ mod command_ctrl_tests {
             "mousehop-disconnect-test".to_owned(),
         ])
         .expect("test certificate");
-        let conn = MousehopConnection::new(cert, Default::default(), Default::default());
+        let conn = MousehopConnection::new(
+            cert,
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
         let (event_tx, _event_rx) = channel();
         let (_request_tx, request_rx) = channel();
         CaptureTask {

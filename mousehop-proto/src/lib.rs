@@ -1,3 +1,5 @@
+pub mod transport;
+
 use input_event::{
     ClipboardEvent, Event as InputEvent, KeyboardEvent, PointerEvent,
     display::{DisplayLayout, DisplayRect},
@@ -72,8 +74,43 @@ pub const CAP_ATOMIC_HANDOVER: u32 = 1 << 0;
 /// was actually applied.
 pub const CAP_TRANSACTIONAL_HANDOVER: u32 = 1 << 1;
 
+/// Controller requests replay of source-generated trackpad momentum.
+/// This is a per-connection preference, not an always-advertised capability.
+pub const CAP_SCROLL_INERTIA_REQUEST: u32 = 1 << 4;
+
 /// Capabilities implemented completely by this protocol build.
 pub const PROTOCOL_CAPABILITIES: u32 = CAP_ATOMIC_HANDOVER | CAP_TRANSACTIONAL_HANDOVER;
+
+#[cfg(test)]
+mod scroll_inertia_tests {
+    use super::*;
+
+    #[test]
+    fn scroll_inertia_preference_roundtrips_with_transport_capabilities() {
+        for requested in [false, true] {
+            for transport in [0, transport::CAP_KCP_INPUT_V1 | transport::CAP_KCP_REQUEST] {
+                let capabilities = PROTOCOL_CAPABILITIES
+                    | transport
+                    | if requested {
+                        CAP_SCROLL_INERTIA_REQUEST
+                    } else {
+                        0
+                    };
+                let hello = ProtoEvent::Hello {
+                    magic: PROTOCOL_MAGIC,
+                    commit: [0; 8],
+                    capabilities,
+                };
+                let (bytes, len): ([u8; MAX_EVENT_SIZE], usize) = hello.into();
+                let decoded = decode_fixed_event(&bytes[..len]).unwrap();
+                assert!(
+                    matches!(decoded, ProtoEvent::Hello { capabilities: actual, .. } if actual == capabilities)
+                );
+            }
+        }
+        assert_eq!(PROTOCOL_CAPABILITIES & CAP_SCROLL_INERTIA_REQUEST, 0);
+    }
+}
 
 /// error type for protocol violations
 #[derive(Debug, Error)]

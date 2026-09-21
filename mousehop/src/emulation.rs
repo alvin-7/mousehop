@@ -29,6 +29,7 @@ use tokio::{
 
 fn to_pp(peer: &IncomingPeerConfig) -> ReceivePostProcessing {
     ReceivePostProcessing {
+        scroll_inertia: false,
         natural_scroll: peer.natural_scroll,
         mouse_sensitivity: peer.mouse_sensitivity,
     }
@@ -304,6 +305,7 @@ impl Emulation {
             request_rx,
             event_tx,
             addr_to_fingerprint: HashMap::new(),
+            scroll_inertia_sessions: HashMap::new(),
             incoming_peers: HashMap::new(),
             locked_hosts: HashSet::new(),
             latest_host_input_states: HashMap::new(),
@@ -378,6 +380,8 @@ struct ListenTask {
     /// Lets ListenTask resolve `IncomingPeerConfig` for an incoming
     /// peer without a per-packet round-trip into the listener.
     addr_to_fingerprint: HashMap<SocketAddr, String>,
+    /// Opt-in belongs to the authenticated connection, never a recycled address.
+    scroll_inertia_sessions: HashMap<SocketAddr, ListenerSession>,
     /// Latest authorized-peers map pushed by Service. Read on Accept
     /// and on `SetIncomingPeers` to build the per-handle
     /// `ReceivePostProcessing` snapshots that go into InputEmulation.
@@ -394,11 +398,17 @@ struct ListenTask {
 
 impl ListenTask {
     fn post_processing_for_addr(&self, addr: SocketAddr) -> ReceivePostProcessing {
-        self.addr_to_fingerprint
+        let mut pp = self
+            .addr_to_fingerprint
             .get(&addr)
             .and_then(|fp| self.incoming_peers.get(fp))
             .map(to_pp)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        pp.scroll_inertia = self
+            .scroll_inertia_sessions
+            .get(&addr)
+            .is_some_and(|session| self.session_is_current(addr, *session));
+        pp
     }
 
     fn session_is_current(&self, addr: SocketAddr, session: ListenerSession) -> bool {
@@ -512,23 +522,25 @@ impl ListenTask {
         loop {
             select! {
                 e = self.listener.next() => {match e {
-                    Some(ListenEvent::Msg { event, addr, session }) => {
+                    Some(ListenEvent::Msg { event, addr, session, receipt }) => {
                         log::trace!("{event} <-<-<-<-<- {addr} session {session}");
                         last_response.insert(addr, (session, Instant::now()));
+                        'processing: {
+                        if receipt.as_ref().is_some_and(|r| !r.valid()) { break 'processing; }
                         match event {
                             ProtoEvent::Enter(pos) => {
                                 if !remote_input_allowed(&self.locked_hosts, addr) {
                                     log::debug!("dropping Enter from locked host {addr}");
                                 } else if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr, session).await {
                                     if !self.session_is_current(addr, session) {
-                                        continue;
+                                        break 'processing;
                                     }
                                     log::info!("releasing capture before legacy entry from {addr} session {session}");
                                     if !self.request_capture_release().await
                                         || !self.session_is_current(addr, session)
                                     {
                                         log::debug!("legacy entry was superseded while capture released");
-                                        continue;
+                                        break 'processing;
                                     }
                                     // A lost prior Leave must not let a fresh
                                     // crossing inherit held keys in the existing
@@ -551,7 +563,7 @@ impl ListenTask {
                                         topology_epoch,
                                         topology_generation,
                                     ).await {
-                                        continue;
+                                        break 'processing;
                                     }
                                     legacy_enter_ready.insert((addr, session));
                                     input_owner_sessions.insert((addr, session), 0);
@@ -579,7 +591,7 @@ impl ListenTask {
                                     });
                                 if !remote_input_allowed(&self.locked_hosts, addr) {
                                     log::debug!("dropping handover {serial} from locked host {addr}");
-                                    continue;
+                                    break 'processing;
                                 }
                                 match classify_handover(
                                     completed_handovers.get(&key).map(|completed| completed.serial),
@@ -596,7 +608,7 @@ impl ListenTask {
                                             log::debug!(
                                                 "withholding Ack for revoked handover {serial} from {addr} session {session}"
                                             );
-                                            continue;
+                                            break 'processing;
                                         }
                                         let completed = completed_handovers
                                             .get(&key)
@@ -630,13 +642,13 @@ impl ListenTask {
                                             )
                                             .await;
                                         }
-                                        continue;
+                                        break 'processing;
                                     }
                                     HandoverDisposition::DropStale => {
                                         log::debug!(
                                             "dropping stale handover {serial} from {addr} session {session}"
                                         );
-                                        continue;
+                                        break 'processing;
                                     }
                                     HandoverDisposition::Apply => {}
                                 }
@@ -645,10 +657,10 @@ impl ListenTask {
                                     .get_certificate_fingerprint(addr, session)
                                     .await
                                 else {
-                                    continue;
+                                    break 'processing;
                                 };
                                 if !self.session_is_current(addr, session) {
-                                    continue;
+                                    break 'processing;
                                 }
                                 log::info!(
                                     "releasing capture before atomic handover {serial} from {addr} session {session}"
@@ -659,7 +671,7 @@ impl ListenTask {
                                     log::debug!(
                                         "handover {serial} was superseded while capture released"
                                     );
-                                    continue;
+                                    break 'processing;
                                 }
                                 // Never carry pressed-key state from a prior
                                 // crossing into this newer transaction when its
@@ -669,7 +681,7 @@ impl ListenTask {
                                     let edge = entry_edge(pos);
                                     match self
                                         .emulation_proxy
-                                        .warp_cursor_to_edge(edge, f64::from(cross_fraction))
+                                        .warp_cursor_to_edge(edge, f64::from(cross_fraction), receipt.clone())
                                         .await
                                     {
                                         Some(EdgeWarpOutcome::Applied(layout)) => {
@@ -687,7 +699,7 @@ impl ListenTask {
                                             log::warn!(
                                                 "handover {serial} cursor warp did not complete; withholding Ack"
                                             );
-                                            continue;
+                                            break 'processing;
                                         }
                                     }
                                 } else {
@@ -697,7 +709,7 @@ impl ListenTask {
                                     )
                                 };
                                 if !self.session_is_current(addr, session) {
-                                    continue;
+                                    break 'processing;
                                 }
                                 let pp = self.post_processing_for_addr(addr);
                                 let bounds = layout.as_ref().and_then(DisplayLayout::size);
@@ -716,7 +728,7 @@ impl ListenTask {
                                     topology_epoch,
                                     topology_generation,
                                 ).await {
-                                    continue;
+                                    break 'processing;
                                 }
                                 input_owner_sessions.insert(key, serial);
                                 completed_handovers.insert(
@@ -826,7 +838,7 @@ impl ListenTask {
                                         "dropping input without active ownership from {addr} session {session}"
                                     );
                                 } else {
-                                    self.emulation_proxy.consume(event, addr);
+                                    self.emulation_proxy.consume_checked(event, addr, receipt.clone());
                                 }
                             }
                             ProtoEvent::HandoverInput { serial, event } => {
@@ -838,7 +850,7 @@ impl ListenTask {
                                     serial,
                                 ) == TransactionalInputDisposition::Consume
                                 {
-                                    self.emulation_proxy.consume(event, addr);
+                                    self.emulation_proxy.consume_checked(event, addr, receipt.clone());
                                 } else {
                                     log::debug!(
                                         "rejecting input for unowned handover {serial} from {addr} session {session}"
@@ -949,6 +961,15 @@ impl ListenTask {
                                 ..
                             } => {
                                 peer_capabilities.insert((addr, session), capabilities);
+                                if self.session_is_current(addr, session) {
+                                    if capabilities & mousehop_proto::CAP_SCROLL_INERTIA_REQUEST != 0 {
+                                        self.scroll_inertia_sessions.insert(addr, session);
+                                    } else {
+                                        self.scroll_inertia_sessions.remove(&addr);
+                                    }
+                                    let pp = self.post_processing_for_addr(addr);
+                                    self.emulation_proxy.set_post_processing(addr, pp);
+                                }
                                 self.listener.reply(addr, session, ProtoEvent::hello(local_commit())).await;
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
                             }
@@ -989,14 +1010,17 @@ impl ListenTask {
                                     );
                                     let _ = self
                                         .emulation_proxy
-                                        .warp_cursor_to_edge(edge, f64::from(cross_fraction))
+                                        .warp_cursor_to_edge(edge, f64::from(cross_fraction), receipt.clone())
                                         .await;
                                 }
                             }
                             _ => {}
                         }
+                        }
+                        if let Some(receipt) = receipt { self.emulation_proxy.complete(receipt).await; }
                     }
                     Some(ListenEvent::Accept { addr, session, fingerprint }) => {
+                        self.scroll_inertia_sessions.remove(&addr);
                         // A reused UDP address is a distinct authenticated
                         // session. Do not let the old heartbeat make it look
                         // responsive before this connection speaks.
@@ -1029,6 +1053,9 @@ impl ListenTask {
                         }).expect("channel closed");
                     }
                     Some(ListenEvent::Disconnected { addr, session }) => {
+                        if self.scroll_inertia_sessions.get(&addr) == Some(&session) {
+                            self.scroll_inertia_sessions.remove(&addr);
+                        }
                         if last_response
                             .get(&addr)
                             .is_some_and(|(current, _)| *current == session)
@@ -1290,7 +1317,8 @@ pub(crate) struct EmulationProxy {
 }
 
 enum ProxyRequest {
-    Input(Event, SocketAddr),
+    Input(Event, SocketAddr, Option<crate::transport::Receipt>),
+    Barrier(oneshot::Sender<()>),
     Remove(SocketAddr),
     /// Terminal DTLS teardown. Unlike `Remove`, also discard per-address
     /// settings because a reconnect normally arrives from a new ephemeral
@@ -1301,7 +1329,12 @@ enum ProxyRequest {
     /// Warp the local cursor to an absolute position. Used on
     /// `Enter` to seat the cursor at the entry edge so the
     /// capturing peer's wall-press model is synchronized.
-    WarpToEdge(DisplayEdge, f64, oneshot::Sender<Option<EdgeWarpOutcome>>),
+    WarpToEdge(
+        DisplayEdge,
+        f64,
+        oneshot::Sender<Option<EdgeWarpOutcome>>,
+        Option<crate::transport::Receipt>,
+    ),
     /// Query and cache a fresh topology snapshot on the emulation task. Entry
     /// metadata uses this instead of the periodic cache so a hotplug cannot
     /// split cursor placement and advertised geometry across generations.
@@ -1363,6 +1396,7 @@ impl EmulationProxy {
         &self,
         edge: DisplayEdge,
         cross_fraction: f64,
+        receipt: Option<crate::transport::Receipt>,
     ) -> Option<EdgeWarpOutcome> {
         if !self.emulation_active.get() {
             return None;
@@ -1370,7 +1404,12 @@ impl EmulationProxy {
         let (completion, completed) = oneshot::channel();
         if self
             .request_tx
-            .send(ProxyRequest::WarpToEdge(edge, cross_fraction, completion))
+            .send(ProxyRequest::WarpToEdge(
+                edge,
+                cross_fraction,
+                completion,
+                receipt,
+            ))
             .is_err()
         {
             return None;
@@ -1424,8 +1463,30 @@ impl EmulationProxy {
         // ignore events if emulation is currently disabled
         if self.emulation_active.get() {
             self.request_tx
-                .send(ProxyRequest::Input(event, addr))
+                .send(ProxyRequest::Input(event, addr, None))
                 .expect("channel closed");
+        }
+    }
+
+    fn consume_checked(
+        &self,
+        event: Event,
+        addr: SocketAddr,
+        receipt: Option<crate::transport::Receipt>,
+    ) {
+        if self.emulation_active.get() {
+            let _ = self
+                .request_tx
+                .send(ProxyRequest::Input(event, addr, receipt));
+        } else if let Some(receipt) = receipt {
+            receipt.abort();
+        }
+    }
+
+    async fn complete(&self, receipt: crate::transport::Receipt) {
+        let (tx, rx) = oneshot::channel();
+        if self.request_tx.send(ProxyRequest::Barrier(tx)).is_ok() {
+            receipt.after(rx).await;
         }
     }
 
@@ -1497,11 +1558,14 @@ impl EmulationTask {
                     ProxyRequest::Reenable => break,
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::Barrier(done) => {
+                        drop(done); // A stopped backend cannot certify consumption.
+                    }
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::Forget(addr) => {
                         forget_peer_state(&mut self.handles, &mut self.post_processing, addr);
                     }
-                    ProxyRequest::WarpToEdge(_, _, completion) => {
+                    ProxyRequest::WarpToEdge(_, _, completion, _) => {
                         let _ = completion.send(None);
                     }
                     ProxyRequest::RefreshDisplayLayout(completion) => {
@@ -1638,7 +1702,9 @@ impl EmulationTask {
                     }
                 }
                 e = self.request_rx.recv() => match e.expect("channel closed") {
-                    ProxyRequest::Input(event, addr) => {
+                    ProxyRequest::Barrier(done) => { let _ = done.send(()); }
+                    ProxyRequest::Input(event, addr, receipt) => {
+                        if receipt.as_ref().is_some_and(|r| !r.valid()) { continue; }
                         let handle = match self.handles.get(&addr) {
                             Some(&handle) => handle,
                             None => {
@@ -1655,7 +1721,11 @@ impl EmulationTask {
                                 handle
                             }
                         };
-                        emulation.consume(event, handle).await?;
+                        if receipt.as_ref().is_some_and(|r| !r.valid()) { continue; }
+                        if let Err(error) = emulation.consume(event, handle).await {
+                            if let Some(receipt) = receipt { receipt.abort(); }
+                            return Err(error.into());
+                        }
                     },
                     ProxyRequest::Remove(addr) => {
                         if let Some(handle) = self.handles.remove(&addr) {
@@ -1685,7 +1755,11 @@ impl EmulationTask {
                             emulation.destroy(handle).await;
                         }
                     }
-                    ProxyRequest::WarpToEdge(edge, cross_fraction, completion) => {
+                    ProxyRequest::WarpToEdge(edge, cross_fraction, completion, receipt) => {
+                        if receipt.as_ref().is_some_and(|r| !r.valid()) {
+                            let _ = completion.send(None);
+                            continue;
+                        }
                         let result = emulation.warp_cursor_to_edge(edge, cross_fraction).await;
                         let outcome = match result {
                             Ok(EdgeWarpOutcome::Applied(layout)) => {
@@ -1747,14 +1821,17 @@ async fn wait_for_termination(
     loop {
         match rx.recv().await.expect("channel closed") {
             ProxyRequest::Terminate => return,
-            ProxyRequest::Input(_, _) => continue,
+            ProxyRequest::Input(..) => continue,
+            ProxyRequest::Barrier(done) => {
+                drop(done);
+            }
             ProxyRequest::Remove(addr) => {
                 handles.remove(&addr);
             }
             ProxyRequest::Forget(addr) => {
                 forget_peer_state(handles, post_processing, addr);
             }
-            ProxyRequest::WarpToEdge(_, _, completion) => {
+            ProxyRequest::WarpToEdge(_, _, completion, _) => {
                 let _ = completion.send(None);
             }
             ProxyRequest::RefreshDisplayLayout(completion) => {
@@ -1938,6 +2015,7 @@ mod lock_state_tests {
             (
                 disconnected,
                 ReceivePostProcessing {
+                    scroll_inertia: false,
                     natural_scroll: true,
                     mouse_sensitivity: 1.25,
                 },

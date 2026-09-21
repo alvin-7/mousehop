@@ -112,6 +112,8 @@ impl Display for Backend {
 /// from the IPC layer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ReceivePostProcessing {
+    /// Replay source-generated scroll momentum when the controller opts in.
+    pub scroll_inertia: bool,
     /// Sign-flip scroll deltas before injection.
     pub natural_scroll: bool,
     /// Linear multiplier on motion deltas. 1.0 = passthrough.
@@ -121,6 +123,7 @@ pub struct ReceivePostProcessing {
 impl Default for ReceivePostProcessing {
     fn default() -> Self {
         Self {
+            scroll_inertia: false,
             natural_scroll: false,
             mouse_sensitivity: 1.0,
         }
@@ -240,17 +243,16 @@ impl InputEmulation {
             .get(&handle)
             .copied()
             .unwrap_or_default();
-        // Drop the source OS's momentum-coast scroll on a non-macOS sink. This
-        // machine doesn't replay OS momentum for injected scroll, and a cohort
-        // app synthesises its own fling from the gesture — so replaying a
-        // forwarded macOS coast just feeds its gap-inference a gapless stream
-        // and pins it at the edges. A macOS sink keeps these (it replays the
-        // coast, so a Mac->Mac session still glides). See input_event docs.
+        // Preserve the historical non-macOS default, but allow the controller
+        // to replay the source's momentum deltas. Do not synthesize a second
+        // coast: applications may already apply their own scroll smoothing.
         #[cfg(not(target_os = "macos"))]
-        if matches!(
-            event,
-            Event::Pointer(PointerEvent::Axis { momentum: true, .. })
-        ) {
+        if !pp.scroll_inertia
+            && matches!(
+                event,
+                Event::Pointer(PointerEvent::Axis { momentum: true, .. })
+            )
+        {
             return Ok(());
         }
         let event = match event {
@@ -491,6 +493,206 @@ trait Emulation: Send {
     /// connection still works.
     async fn warp_cursor(&mut self, _x: i32, _y: i32) -> Result<(), EmulationError> {
         Ok(())
+    }
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod scroll_inertia_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingBackend(Arc<Mutex<Vec<(EmulationHandle, Event)>>>);
+    #[async_trait]
+    impl Emulation for RecordingBackend {
+        async fn consume(
+            &mut self,
+            event: Event,
+            handle: EmulationHandle,
+        ) -> Result<(), EmulationError> {
+            self.0.lock().unwrap().push((handle, event));
+            Ok(())
+        }
+        async fn create(&mut self, _: EmulationHandle) {}
+        async fn destroy(&mut self, _: EmulationHandle) {}
+        async fn terminate(&mut self) {}
+    }
+
+    #[tokio::test]
+    async fn disconnect_r7_cleanup_releases_keys_without_touching_replacement_handle() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut emulation = InputEmulation {
+            emulation: Box::new(RecordingBackend(recorded.clone())),
+            handles: HashSet::new(),
+            pressed_keys: HashMap::new(),
+            post_processing: HashMap::new(),
+            clipboard: None,
+        };
+        for handle in [1, 2] {
+            emulation.create(handle).await;
+            emulation
+                .consume(
+                    Event::Keyboard(KeyboardEvent::Key {
+                        time: 1,
+                        key: 29,
+                        state: 1,
+                    }),
+                    handle,
+                )
+                .await
+                .unwrap();
+        }
+        emulation.destroy(1).await;
+        assert!(!emulation.has_pressed_keys(1));
+        assert!(emulation.has_pressed_keys(2));
+        let released = |handle| {
+            recorded
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(h, e)| {
+                    *h == handle
+                        && matches!(
+                            e,
+                            Event::Keyboard(KeyboardEvent::Key {
+                                key: 29,
+                                state: 0,
+                                ..
+                            })
+                        )
+                })
+                .count()
+        };
+        assert_eq!(released(1), 1);
+        assert_eq!(released(2), 0);
+        emulation.terminate().await;
+        assert_eq!(released(1), 1);
+        assert_eq!(released(2), 1);
+        assert!(emulation.handles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn natural_scroll_reverses_both_axes_for_touchpad_and_wheel() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut emulation = InputEmulation {
+            emulation: Box::new(RecordingBackend(recorded.clone())),
+            handles: HashSet::new(),
+            pressed_keys: HashMap::new(),
+            post_processing: HashMap::new(),
+            clipboard: None,
+        };
+        emulation.create(1).await;
+        for natural_scroll in [false, true] {
+            emulation.set_post_processing(
+                1,
+                ReceivePostProcessing {
+                    natural_scroll,
+                    scroll_inertia: true,
+                    ..Default::default()
+                },
+            );
+            for axis in [0, 1] {
+                for value in [-120, 120] {
+                    let expected = if natural_scroll { -value } else { value };
+                    for momentum in [false, true] {
+                        emulation
+                            .consume(
+                                Event::Pointer(PointerEvent::Axis {
+                                    time: 10,
+                                    axis,
+                                    value: value as f64,
+                                    momentum,
+                                }),
+                                1,
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            recorded.lock().unwrap().pop(),
+                            Some((
+                                1,
+                                Event::Pointer(PointerEvent::Axis {
+                                    time: 10,
+                                    axis,
+                                    value: expected as f64,
+                                    momentum,
+                                })
+                            ))
+                        );
+                    }
+                    emulation
+                        .consume(
+                            Event::Pointer(PointerEvent::AxisDiscrete120 { axis, value }),
+                            1,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        recorded.lock().unwrap().pop(),
+                        Some((
+                            1,
+                            Event::Pointer(PointerEvent::AxisDiscrete120 {
+                                axis,
+                                value: expected,
+                            })
+                        ))
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scroll_inertia_is_opt_in_per_handle_and_preserves_direction_processing() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut emulation = InputEmulation {
+            emulation: Box::new(RecordingBackend(recorded.clone())),
+            handles: HashSet::new(),
+            pressed_keys: HashMap::new(),
+            post_processing: HashMap::new(),
+            clipboard: None,
+        };
+        emulation.create(1).await;
+        emulation.create(2).await;
+        let scroll = |axis, momentum| {
+            Event::Pointer(PointerEvent::Axis {
+                time: 10,
+                axis,
+                value: 12.0,
+                momentum,
+            })
+        };
+        emulation.consume(scroll(0, true), 1).await.unwrap();
+        assert!(recorded.lock().unwrap().is_empty());
+        emulation.consume(scroll(0, false), 1).await.unwrap();
+        assert_eq!(recorded.lock().unwrap().len(), 1);
+        emulation.set_post_processing(
+            1,
+            ReceivePostProcessing {
+                scroll_inertia: true,
+                natural_scroll: true,
+                ..Default::default()
+            },
+        );
+        for axis in [0, 1] {
+            emulation.consume(scroll(axis, true), 1).await.unwrap();
+        }
+        emulation.consume(scroll(0, true), 2).await.unwrap();
+        let events = recorded.lock().unwrap().clone();
+        assert_eq!(events.len(), 3);
+        for (axis, (_, event)) in events.iter().skip(1).enumerate() {
+            assert_eq!(
+                *event,
+                Event::Pointer(PointerEvent::Axis {
+                    time: 10,
+                    axis: axis as u8,
+                    value: -12.0,
+                    momentum: true,
+                })
+            );
+        }
+        emulation.set_post_processing(1, ReceivePostProcessing::default());
+        emulation.consume(scroll(0, true), 1).await.unwrap();
+        assert_eq!(recorded.lock().unwrap().len(), 3);
     }
 }
 

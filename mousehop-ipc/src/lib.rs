@@ -385,6 +385,12 @@ pub struct ClientConfig {
     /// `false` so existing peers keep their current modifier mapping.
     #[serde(default)]
     pub command_as_ctrl: bool,
+    /// Effective outgoing preference. Incoming connections negotiate independently.
+    #[serde(default)]
+    pub use_kcp: bool,
+    /// Opt in to replaying source trackpad momentum on this outgoing connection.
+    #[serde(default)]
+    pub scroll_inertia: bool,
     /// When true, the pointer may enter this outgoing client only while
     /// [`Self::crossing_modifier`] is physically held. Default-off preserves
     /// the historical automatic edge crossing for existing configurations.
@@ -409,6 +415,8 @@ impl Default for ClientConfig {
             network_locks: HashMap::new(),
             clipboard_send: false,
             command_as_ctrl: false,
+            use_kcp: false,
+            scroll_inertia: false,
             require_crossing_modifier: false,
             crossing_modifier: CrossingModifier::default(),
         }
@@ -525,6 +533,9 @@ impl<'de> Deserialize<'de> for IncomingPeerConfig {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ClientState {
+    /// Actual session state, never inferred from the preference switch.
+    #[serde(default)]
+    pub transport_status: String,
     /// events should be sent to and received from the client
     pub active: bool,
     /// `active` address of the client, used to send data to.
@@ -745,6 +756,9 @@ pub enum FrontendRequest {
     /// On a macOS sender, toggle the one-way Command-to-Control alias
     /// for the given outgoing client.
     SetClientCommandAsCtrl(ClientHandle, bool),
+    /// Persist this peer's transport preference and reconnect only this peer.
+    SetClientUseKcp(ClientHandle, bool),
+    SetClientScrollInertia(ClientHandle, bool),
     /// Toggle whether crossing into an outgoing client requires its selected
     /// modifier to be held.
     SetClientRequireCrossingModifier(ClientHandle, bool),

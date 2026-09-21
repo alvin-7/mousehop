@@ -36,20 +36,62 @@ The dispatcher component takes events from the event receiver and passes them
 to the correct backend corresponding to the type of client.
 
 
-## Requests
+## Network transport
 
-// TODO this currently works differently
+Peer events and control messages use authenticated DTLS connections over UDP.
+There is no separate TCP connection-request protocol in the current data path.
+Each accepted or outbound connection has its own local session generation.
 
-Aside from events, requests can be sent via a simple protocol.
-For this, a simple tcp server is listening on the same port as the udp
-event receiver and accepts requests for connecting to a device or to
-request the keymap of a device.
+Each outgoing client's `use_kcp` setting is controlled in Outgoing Connections.
+Changing it releases that peer's capture and reconnects only that peer. Incoming
+connections automatically follow the authenticated controller's selection.
+The old top-level `input_transport` supplies a default only when a client lacks
+an explicit `use_kcp`; explicit false survives saving. Legacy remains the default.
+KCP negotiates a message channel inside the same DTLS connection and never downgrades.
+Hello, Ping/Pong and clipboard stay direct. With both peers on 0.17.7 or newer,
+pointer motion also uses direct encrypted UDP; keyboard, buttons, scrolling and
+handover/control events share the reliable channel. Cumulative motion and
+reliable checkpoints preserve displacement and critical-event ordering. Older
+KCP peers retain the all-reliable input channel. Existing business
+acknowledgements remain required.
 
-```mermaid
-sequenceDiagram
-    Alice->>+Bob: Request Connection (secret)
-    Bob-->>-Alice: Ack (Keyboard Layout)
-```
+Transport support bit `1 << 2`, controller request bit `1 << 3`, reserved tag 240
+and transport version 2 identify the extension without renumbering existing event
+tags. Capability alone does not select KCP. A repeated Hello cannot change the
+mode of an established session. Legacy controllers retain the old wire format;
+the experimental version-1 KCP build must be upgraded on both sides. Offer/Ready
+bind a negotiation ID and KCP conversation to the DTLS session. Data frames
+include the negotiation ID, and progress frames report cumulative sent and
+business-consumed sequence numbers. KCP ACKs alone do not certify consumption.
+The top-level `kcp_stall_timeout_ms = 300` setting (integer milliseconds,
+1..=60000, default 300) is validated when loading configuration and preserved
+when saving it. Invalid TOML settings now fail startup rather than silently
+falling back to defaults; invalid live reloads retain the previous configuration.
+The service snapshots the timeout at startup for both connection managers,
+including future reconnects and listener rebinds. File reloads do not change the
+running policy: restart each host after editing its file. There is no wire
+negotiation of this value; increasing one host's timeout cannot delay the other's.
+This policy covers peer liveness, sent-but-unconsumed input, local consumption,
+the receive gap, KCP DTLS writes and consumption receipts. Remaining receive-gap
+age restarts only when the contiguous application receive watermark advances;
+catching up clears it. Bootstrap, ACK-only, duplicate or buffered out-of-order
+data and Progress alone cannot renew it. Legacy keeps its previous I/O policy.
+Independent bounds remain: 6s transport negotiation, 300ms close cleanup, fixed
+queue/window budgets and the existing business handshake/heartbeat timeouts.
+
+Outgoing `ClientConfig.scroll_inertia` defaults to false and is persisted per
+device. The controller's authenticated Hello sets preference bit `1 << 4` only
+when enabled; KCP's Hello wrapping preserves it. The receiver scopes the opt-in
+to the current DTLS session and supplies it to receive post-processing. On a
+non-macOS receiver, default-off drops source momentum, while opt-in forwards the
+original deltas through the existing natural-scroll transform and OS backend.
+No event tag or existing wire layout changes; older peers ignore the new bit.
+The new IPC preference defaults to false when absent. Toggle changes use the
+same release barrier and targeted reconnect as the outgoing KCP switch, without
+affecting other devices. Both peers must be updated for this preference to work.
+Queue/age violations close the session and invalidate queued input before the
+existing disconnect cleanup runs. See [reliable input configuration](README.md#experimental-reliable-input-over-dtls)
+for timeout settings, transport behavior and experimental limitations.
 
 ## Problems
 The general Idea is to have a bidirectional connection by default, meaning

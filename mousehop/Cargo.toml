@@ -19,6 +19,8 @@ include = [
 shadow-rs = "1.2.0"
 
 [dependencies]
+kcp = "=0.6.0"
+async-trait = "0.1"
 input-event = { workspace = true }
 input-emulation = { workspace = true, default-features = false }
 input-capture = { workspace = true, default-features = false }
