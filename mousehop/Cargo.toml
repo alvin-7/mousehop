@@ -13,10 +13,12 @@ include = [
     # so they must ship in the published crate.
     "com.mousehop.Mousehop.desktop",
     "assets/com.mousehop.Mousehop.svg",
+    "assets/mousehop.ico",
 ]
 
 [build-dependencies]
 shadow-rs = "1.2.0"
+winresource = "0.1.31"
 
 [dependencies]
 kcp = "=0.6.0"

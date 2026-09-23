@@ -24,6 +24,10 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
 use super::error::MacOSEmulationCreationError;
+use crate::macos_keyboard::{
+    CleanupResidue, Injection, InjectionPath, KEYBOARD_LOG_TARGET, KeySink, KeyboardInjector,
+    ModifierKinds, ModifierSides, describe_sides, key_category, path_name,
+};
 
 /// Fallback initial key-repeat delay used only when the host's
 /// `InitialKeyRepeat` global preference can't be read (see
@@ -33,6 +37,82 @@ const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
 /// global preference can't be read (see [`read_key_repeat_prefs`]).
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Why the key-repeat task stopped, named in diagnostics.
+#[derive(Clone, Copy, Debug)]
+enum RepeatStopReason {
+    /// Another key took over the single repeat slot.
+    Replaced,
+    /// The repeating key was released.
+    Released,
+    /// The client's session is being destroyed.
+    Destroyed,
+    /// The backend itself is terminating.
+    Terminated,
+}
+
+impl RepeatStopReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Replaced => "replaced",
+            Self::Released => "released",
+            Self::Destroyed => "destroyed",
+            Self::Terminated => "terminated",
+        }
+    }
+}
+
+/// One `cleanup_begin` line shared by destroy/terminate. `handle` is the
+/// client handle destroy carries; terminate has none.
+fn log_cleanup_begin(
+    session: u64,
+    handle: Option<EmulationHandle>,
+    source: &str,
+    pending: CleanupResidue,
+    path: InjectionPath,
+) {
+    let handle = match handle {
+        Some(handle) => handle.to_string(),
+        None => "none".to_string(),
+    };
+    log::debug!(
+        target: KEYBOARD_LOG_TARGET,
+        "event=cleanup_begin session={session} source={source} handle={handle} path={} \
+         pressed_keys={} modifier_sides={}",
+        path_name(path),
+        pending.pressed_keys,
+        describe_sides(pending.modifier_sides),
+    );
+}
+
+/// One `cleanup_end` line: a clean state at debug, remaining input as a
+/// warning so a stuck key survives even without debug logging enabled.
+fn log_cleanup_end(
+    session: u64,
+    handle: Option<EmulationHandle>,
+    source: &str,
+    pending: CleanupResidue,
+) {
+    let handle = match handle {
+        Some(handle) => handle.to_string(),
+        None => "none".to_string(),
+    };
+    if pending.is_empty() {
+        log::debug!(
+            target: KEYBOARD_LOG_TARGET,
+            "event=cleanup_end session={session} source={source} handle={handle} residue=clean"
+        );
+    } else {
+        log::warn!(
+            target: KEYBOARD_LOG_TARGET,
+            "event=cleanup_end session={session} source={source} handle={handle} \
+             residue=stuck_input_remains pressed_keys={} modifier_sides={} \
+             note=release_failed_on_both_paths_state_kept_for_retry",
+            pending.pressed_keys,
+            describe_sides(pending.modifier_sides),
+        );
+    }
+}
 
 /// Reads this Mac's keyboard repeat settings and returns them as
 /// `(initial_delay, repeat_interval)`.
@@ -128,6 +208,10 @@ pub(crate) struct MacOSEmulation {
     /// exposes left/right key codes independently, so releasing one side must
     /// not clear Shift/Control/Option/Command while its peer remains held.
     physical_modifiers: Cell<PhysicalModifiers>,
+    /// Keyboard injection path plus the modifier and key state macOS has been
+    /// told about. Cloned into the repeat task so a held key repeats through
+    /// the same injector instead of a second one.
+    key_injector: KeyboardInjector,
     /// IOPMAssertionID returned by the most recent
     /// `IOPMAssertionDeclareUserActivity` call, kept for re-use within
     /// the system's 5-second coalesce window. Without this, a CGEvent
@@ -208,8 +292,26 @@ impl MacOSEmulation {
 
         let event_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
             .map_err(|_| MacOSEmulationCreationError::EventSourceCreation)?;
+        let key_sink = Rc::new(MacKeySink::new(event_source.clone()));
+        let key_injector = KeyboardInjector::new(key_sink);
+        match key_injector.current_path() {
+            InjectionPath::Nx => log::info!(
+                target: KEYBOARD_LOG_TARGET,
+                "event=injection_path_selected session={} path=iohid permissions=granted \
+                 detail=real_hid_key_codes",
+                key_injector.session()
+            ),
+            InjectionPath::CgEvent => log::warn!(
+                target: KEYBOARD_LOG_TARGET,
+                "event=injection_path_selected session={} path=cgevent permissions=granted \
+                 reason=iohidsystem_unavailable \
+                 note=cgevent_types_but_does_not_guarantee_macos_system_shortcuts",
+                key_injector.session()
+            ),
+        }
         Ok(Self {
             event_source,
+            key_injector,
             pressed_buttons: HashSet::new(),
             previous_button: None,
             previous_button_click: None,
@@ -221,6 +323,20 @@ impl MacOSEmulation {
             user_activity_assertion: Cell::new(0),
             display_union_cache: Cell::new(None),
         })
+    }
+
+    /// Publish the current remote modifier snapshot to the window server.
+    ///
+    /// The event stream describes modifiers without a side most of the time,
+    /// so the current sides are passed alongside the aggregate and the
+    /// window server's own flags are read first so a locally held modifier is
+    /// not cleared by a remote transition.
+    fn sync_remote_modifiers(&self) {
+        self.key_injector.sync_modifiers(
+            modifier_kinds(self.modifier_state.get()),
+            modifier_sides(self.physical_modifiers.get()),
+            local_modifier_flags(),
+        );
     }
 
     /// Tell the macOS power-manager that real user input is arriving
@@ -319,57 +435,106 @@ impl MacOSEmulation {
         self.button_click_state = 0;
     }
 
-    async fn spawn_repeat_task(&mut self, key: u16) {
+    /// Starts the repeat stream for `key`, releasing the key it replaces.
+    ///
+    /// An error means a release could not be delivered on either injection
+    /// path; it is propagated so the emulation session stops instead of
+    /// typing on top of unconfirmed keyboard state.
+    async fn spawn_repeat_task(&mut self, key: u16) -> Result<(), EmulationError> {
         // there can only be one repeating key and it's
         // always the last to be pressed
-        self.cancel_repeat_task().await;
+        self.cancel_repeat_task(RepeatStopReason::Replaced).await?;
         // initial key event
-        key_event(self.event_source.clone(), key, 1, self.modifier_state.get());
+        self.key_injector.key_down(key);
         // Use the host's own keyboard repeat settings so forwarded keys
         // feel identical to typing directly on this Mac, rather than a
         // fixed hardcoded rate.
         let (repeat_delay, repeat_interval) = read_key_repeat_prefs();
+        log::debug!(
+            target: KEYBOARD_LOG_TARGET,
+            "event=repeat_started session={} category={} repeat_delay_ms={} \
+             repeat_interval_ms={}",
+            self.key_injector.session(),
+            key_category(key),
+            repeat_delay.as_millis(),
+            repeat_interval.as_millis(),
+        );
         // repeat task
-        let event_source = self.event_source.clone();
-        let modifiers = self.modifier_state.clone();
+        let injector = self.key_injector.clone();
         let repeat_task = tokio::task::spawn_local(async move {
             tokio::time::sleep(repeat_delay).await;
             loop {
-                key_event(event_source.clone(), key, 1, modifiers.get());
+                injector.key_down(key);
                 tokio::time::sleep(repeat_interval).await;
             }
         });
         self.repeat_task = Some(repeat_task);
         self.repeat_key = Some(key);
+        Ok(())
     }
 
-    async fn cancel_repeat_task(&mut self) {
+    /// Stops the repeat stream and releases its key through the injector's
+    /// release policy (original path, then one CGEvent retry).
+    async fn cancel_repeat_task(&mut self, reason: RepeatStopReason) -> Result<(), EmulationError> {
         if let Some(task) = self.repeat_task.take() {
             task.abort();
             let _ = task.await;
         }
         if let Some(key) = self.repeat_key.take() {
-            key_event(self.event_source.clone(), key, 0, self.modifier_state.get());
+            log::debug!(
+                target: KEYBOARD_LOG_TARGET,
+                "event=repeat_stopped session={} category={} reason={}",
+                self.key_injector.session(),
+                key_category(key),
+                reason.as_str(),
+            );
+            if let Err(status) = self.key_injector.key_up(key) {
+                return Err(EmulationError::KeyboardInjection(status));
+            }
         }
+        Ok(())
     }
 
-    async fn release_key(&mut self, key: CGKeyCode) {
+    async fn release_key(&mut self, key: CGKeyCode) -> Result<(), EmulationError> {
         if self.repeat_key == Some(key) {
-            self.cancel_repeat_task().await;
+            self.cancel_repeat_task(RepeatStopReason::Released).await
         } else {
             // Pressing a second character ends repeat for the first one and
             // emits its synthetic key-up. Its later physical key-up still
             // needs to pass through, but must not cancel the second key.
-            key_event(self.event_source.clone(), key, 0, self.modifier_state.get());
+            match self.key_injector.key_up(key) {
+                Ok(()) => Ok(()),
+                Err(status) => Err(EmulationError::KeyboardInjection(status)),
+            }
         }
     }
 }
 
 fn request_macos_emulation_permissions() -> Result<(), MacOSEmulationCreationError> {
-    check_macos_emulation_permissions(
+    let result = check_macos_emulation_permissions(
         request_accessibility_permission,
         request_input_control_permission,
-    )
+    );
+    match &result {
+        Ok(()) => log::debug!(
+            target: KEYBOARD_LOG_TARGET,
+            "event=permissions_granted backend=macos permissions=accessibility,input_control"
+        ),
+        Err(MacOSEmulationCreationError::AccessibilityPermission) => log::warn!(
+            target: KEYBOARD_LOG_TARGET,
+            "event=permission_denied backend=macos permission=accessibility \
+             note=gui_owns_the_user_visible_prompt"
+        ),
+        Err(MacOSEmulationCreationError::InputControlPermission) => log::warn!(
+            target: KEYBOARD_LOG_TARGET,
+            "event=permission_denied backend=macos permission=input_control \
+             note=gui_owns_the_user_visible_prompt"
+        ),
+        // The backend does not exist yet, so these lines carry the backend
+        // tag instead of a session id.
+        Err(_) => {}
+    }
+    result
 }
 
 fn check_macos_emulation_permissions<A, I>(
@@ -429,6 +594,8 @@ fn request_input_control_permission() -> bool {
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGPreflightPostEventAccess() -> bool;
+    /// Modifier flags of an event-source state (`CGEventSourceFlagsState`).
+    fn CGEventSourceFlagsState(state_id: c_int) -> u64;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -451,29 +618,159 @@ extern "C" {
 /// here since we ARE the source generating local HID-style input).
 const K_IOPM_USER_ACTIVE_LOCAL: c_int = 0;
 
-fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods) {
-    let event = match CGEvent::new_keyboard_event(event_source, key, state != 0) {
-        Ok(e) => e,
-        Err(_) => {
-            log::warn!("unable to create key event");
-            return;
-        }
-    };
-    event.set_flags(to_cgevent_flags(modifiers));
-    event.post(CGEventTapLocation::HID);
-    log::trace!("key event: {key} {state}");
+/// Opaque `IOHIDSystem` connection owned by `nx_key_bridge.c`.
+#[repr(C)]
+struct NxDriverHandle {
+    _private: [u8; 0],
 }
 
-fn modifier_event(event_source: CGEventSource, depressed: XMods) {
-    let Ok(event) = CGEvent::new(event_source) else {
-        log::warn!("could not create CGEvent");
-        return;
-    };
-    let flags = to_cgevent_flags(depressed);
-    event.set_type(CGEventType::FlagsChanged);
-    event.set_flags(flags);
-    event.post(CGEventTapLocation::HID);
-    log::trace!("modifiers updated: {depressed:?}");
+extern "C" {
+    fn mousehop_nx_open() -> *mut NxDriverHandle;
+    fn mousehop_nx_close(driver: *mut NxDriverHandle);
+    fn mousehop_nx_flags_changed(driver: *mut NxDriverHandle, key_code: u16, flags: u32) -> i32;
+    fn mousehop_nx_key(driver: *mut NxDriverHandle, key_code: u16, down: i32) -> i32;
+}
+
+/// `kern_return_t` success.
+const KERN_SUCCESS: i32 = 0;
+/// The IOHID connection is missing, so this event cannot be posted.
+const NX_DRIVER_UNAVAILABLE: i32 = -2;
+/// `CGEvent` allocation failed, so no platform status is involved.
+const CG_EVENT_CREATION_FAILED: i32 = -1;
+
+/// Owns the `IOHIDSystem` connection used to post real HID events.
+///
+/// `IOHIDPostEvent` is deprecated since macOS 11 and has no replacement. The
+/// call is confined to `nx_key_bridge.c`; this wrapper only manages the
+/// handle's lifetime.
+struct NxDriver(*mut NxDriverHandle);
+
+impl NxDriver {
+    /// Opens the driver, or returns `None` when the window server does not
+    /// expose it (the caller then uses the CGEvent fallback).
+    fn open() -> Option<Self> {
+        let handle = unsafe { mousehop_nx_open() };
+        (!handle.is_null()).then_some(Self(handle))
+    }
+
+    fn flags_changed(&self, key_code: u16, flags: u32) -> Result<(), i32> {
+        match unsafe { mousehop_nx_flags_changed(self.0, key_code, flags) } {
+            KERN_SUCCESS => Ok(()),
+            status => Err(status),
+        }
+    }
+
+    fn key(&self, key_code: u16, down: bool) -> Result<(), i32> {
+        match unsafe { mousehop_nx_key(self.0, key_code, i32::from(down)) } {
+            KERN_SUCCESS => Ok(()),
+            status => Err(status),
+        }
+    }
+}
+
+impl Drop for NxDriver {
+    /// Closes the connection when the backend (and every clone of its
+    /// injector) is gone. `release_all` runs first; this only frees the
+    /// handle.
+    fn drop(&mut self) {
+        unsafe {
+            mousehop_nx_close(self.0);
+        }
+    }
+}
+
+/// The macOS half of [`KeyboardInjector`]: real `NXEventData` events through
+/// `IOHIDPostEvent`, with the legacy `CGEvent` path as a fallback.
+struct MacKeySink {
+    event_source: CGEventSource,
+    driver: Option<NxDriver>,
+}
+
+/// Wraps raw modifier bits in the platform's flag type for the `CGEvent`
+/// fallback.
+///
+/// `core-graphics`' `CGEventFlags` only declares the general modifier bits;
+/// the device-dependent side bits are valid for the window server but unknown
+/// to the crate. `CGEventFlags::from_bits_truncate` would drop them, so the
+/// fallback would lose which side of a modifier is down, and releasing one
+/// side could clear the peer. `from_bits_retain` keeps the raw value while
+/// still typing it.
+fn cg_event_flags(flags: u32) -> CGEventFlags {
+    CGEventFlags::from_bits_retain(u64::from(flags))
+}
+
+impl MacKeySink {
+    fn new(event_source: CGEventSource) -> Self {
+        Self {
+            event_source,
+            driver: NxDriver::open(),
+        }
+    }
+
+    /// Legacy fallback. It still types, but macOS does not treat these events
+    /// as physical HID input, so the system's own keyboard shortcuts are not
+    /// guaranteed on this path.
+    fn inject_cg_event(&self, injection: Injection) -> Result<(), i32> {
+        match injection {
+            Injection::Modifiers { key_code, flags } => {
+                let Ok(event) = CGEvent::new(self.event_source.clone()) else {
+                    return Err(CG_EVENT_CREATION_FAILED);
+                };
+                event.set_type(CGEventType::FlagsChanged);
+                event.set_integer_value_field(
+                    EventField::KEYBOARD_EVENT_KEYCODE,
+                    i64::from(key_code),
+                );
+                event.set_flags(cg_event_flags(flags));
+                event.post(CGEventTapLocation::HID);
+                Ok(())
+            }
+            Injection::Key {
+                key_code,
+                down,
+                cg_flags,
+            } => {
+                let Ok(event) =
+                    CGEvent::new_keyboard_event(self.event_source.clone(), key_code, down)
+                else {
+                    return Err(CG_EVENT_CREATION_FAILED);
+                };
+                event.set_flags(cg_event_flags(cg_flags));
+                event.post(CGEventTapLocation::HID);
+                Ok(())
+            }
+        }
+    }
+}
+
+impl KeySink for MacKeySink {
+    fn preferred_path(&self) -> InjectionPath {
+        if self.driver.is_some() {
+            InjectionPath::Nx
+        } else {
+            InjectionPath::CgEvent
+        }
+    }
+
+    fn inject(&self, path: InjectionPath, injection: Injection) -> Result<(), i32> {
+        match path {
+            InjectionPath::Nx => {
+                let Some(driver) = self.driver.as_ref() else {
+                    return Err(NX_DRIVER_UNAVAILABLE);
+                };
+                match injection {
+                    Injection::Modifiers { key_code, flags } => {
+                        driver.flags_changed(key_code, flags)
+                    }
+                    // Ordinary keys are posted with no global flags so the
+                    // modifier state the flags-changed events published
+                    // survives them.
+                    Injection::Key { key_code, down, .. } => driver.key(key_code, down),
+                }
+            }
+            InjectionPath::CgEvent => self.inject_cg_event(injection),
+        }
+    }
 }
 
 /// Union of every active display's rectangle, as `(origin_x,
@@ -716,18 +1013,9 @@ impl Emulation for MacOSEmulation {
                     // downs until the connection closes.
                     if is_caps_lock(key) {
                         if state == 1 {
-                            key_event(
-                                self.event_source.clone(),
-                                code,
-                                1,
-                                self.modifier_state.get(),
-                            );
-                            key_event(
-                                self.event_source.clone(),
-                                code,
-                                0,
-                                self.modifier_state.get(),
-                            );
+                            if let Err(status) = self.key_injector.caps_tap(code) {
+                                return Err(EmulationError::KeyboardInjection(status));
+                            }
                             toggle_caps_lock(&self.modifier_state);
                         }
                         return Ok(());
@@ -740,22 +1028,17 @@ impl Emulation for MacOSEmulation {
                         state,
                     );
                     if is_modifier {
-                        modifier_event(self.event_source.clone(), self.modifier_state.get());
                         // Modifier presses are state transitions, not
-                        // repeatable characters. Preserve the key event that
-                        // applications expect without creating a repeat task.
-                        key_event(
-                            self.event_source.clone(),
-                            code,
-                            state,
-                            self.modifier_state.get(),
-                        );
+                        // repeatable characters: one flags-changed event that
+                        // carries the real key code of the side that changed,
+                        // and no duplicate key event on top of it.
+                        self.sync_remote_modifiers();
                         return Ok(());
                     }
                     match state {
                         // pressed
-                        1 => self.spawn_repeat_task(code).await,
-                        _ => self.release_key(code).await,
+                        1 => self.spawn_repeat_task(code).await?,
+                        _ => self.release_key(code).await?,
                     }
                 }
                 KeyboardEvent::Modifiers {
@@ -772,7 +1055,7 @@ impl Emulation for MacOSEmulation {
                         locked,
                         group,
                     );
-                    modifier_event(self.event_source.clone(), self.modifier_state.get());
+                    self.sync_remote_modifiers();
                 }
             },
             Event::Clipboard(_) => {
@@ -785,20 +1068,63 @@ impl Emulation for MacOSEmulation {
         Ok(())
     }
 
-    async fn create(&mut self, _handle: EmulationHandle) {}
+    async fn create(&mut self, handle: EmulationHandle) {
+        log::debug!(
+            target: KEYBOARD_LOG_TARGET,
+            "event=session_created session={} handle={} path={}",
+            self.key_injector.session(),
+            handle,
+            path_name(self.key_injector.current_path()),
+        );
+    }
 
-    async fn destroy(&mut self, _handle: EmulationHandle) {
-        self.cancel_repeat_task().await;
+    async fn destroy(&mut self, handle: EmulationHandle) {
+        let session = self.key_injector.session();
+        log_cleanup_begin(
+            session,
+            Some(handle),
+            "destroy",
+            self.key_injector.pending(),
+            self.key_injector.current_path(),
+        );
+        // Lifecycle cleanup cannot propagate an error to a caller; the
+        // injector has already logged the failure and `release_all` below
+        // retries the release through both paths.
+        if let Err(status) = self.cancel_repeat_task(RepeatStopReason::Destroyed).await {
+            log::warn!(
+                target: KEYBOARD_LOG_TARGET,
+                "event=cleanup_repeat_release_failed session={session} source=destroy \
+                 status={status}"
+            );
+        }
         self.release_tracked_buttons();
+        let residue = self.key_injector.release_all();
         self.physical_modifiers.set(PhysicalModifiers::empty());
         self.modifier_state.set(XMods::empty());
+        log_cleanup_end(session, Some(handle), "destroy", residue);
     }
 
     async fn terminate(&mut self) {
-        self.cancel_repeat_task().await;
+        let session = self.key_injector.session();
+        log_cleanup_begin(
+            session,
+            None,
+            "terminate",
+            self.key_injector.pending(),
+            self.key_injector.current_path(),
+        );
+        if let Err(status) = self.cancel_repeat_task(RepeatStopReason::Terminated).await {
+            log::warn!(
+                target: KEYBOARD_LOG_TARGET,
+                "event=cleanup_repeat_release_failed session={session} source=terminate \
+                 status={status}"
+            );
+        }
         self.release_tracked_buttons();
+        let residue = self.key_injector.release_all();
         self.physical_modifiers.set(PhysicalModifiers::empty());
         self.modifier_state.set(XMods::empty());
+        log_cleanup_end(session, None, "terminate", residue);
     }
 
     fn display_bounds(&mut self) -> Option<(u32, u32)> {
@@ -940,6 +1266,42 @@ fn is_caps_lock(key: u32) -> bool {
     scancode::Linux::try_from(key).is_ok_and(|key| key == scancode::Linux::KeyCapsLock)
 }
 
+/// The side-agnostic modifier state a snapshot carries.
+fn modifier_kinds(mods: XMods) -> ModifierKinds {
+    let mut kinds = ModifierKinds::default();
+    if mods.contains(XMods::ShiftMask) {
+        kinds = kinds.with(ModifierKinds::SHIFT);
+    }
+    if mods.contains(XMods::ControlMask) {
+        kinds = kinds.with(ModifierKinds::CONTROL);
+    }
+    // Mod5 is ISO_Level3_Shift (AltGr on Linux); treat it as macOS Option,
+    // which is how the backend has always mapped it.
+    if mods.contains(XMods::Mod1Mask) || mods.contains(XMods::Mod5Mask) {
+        kinds = kinds.with(ModifierKinds::OPTION);
+    }
+    if mods.contains(XMods::Mod4Mask) {
+        kinds = kinds.with(ModifierKinds::COMMAND);
+    }
+    kinds
+}
+
+/// The sides the event stream identified. [`ModifierSides`] mirrors
+/// [`PhysicalModifiers`]' bit order, so this is a bit copy.
+fn modifier_sides(physical: PhysicalModifiers) -> ModifierSides {
+    ModifierSides::from_bits_truncate(physical.bits() as u8)
+}
+
+/// The window server's current modifier flags.
+///
+/// `IOHIDPostEvent` replaces the whole global modifier state, so the remote
+/// snapshot is merged with whatever the local keyboard already holds instead
+/// of clearing it.
+fn local_modifier_flags() -> u32 {
+    let state_id = CGEventSourceStateID::CombinedSessionState as c_int;
+    unsafe { CGEventSourceFlagsState(state_id) as u32 }
+}
+
 fn toggle_caps_lock(modifiers: &Cell<XMods>) {
     let mut state = modifiers.get();
     state.toggle(XMods::LockMask);
@@ -982,27 +1344,6 @@ fn set_modifiers(
     physical.set(physical_state);
 }
 
-fn to_cgevent_flags(depressed: XMods) -> CGEventFlags {
-    let mut flags = CGEventFlags::empty();
-    if depressed.contains(XMods::ShiftMask) {
-        flags |= CGEventFlags::CGEventFlagShift;
-    }
-    if depressed.contains(XMods::LockMask) {
-        flags |= CGEventFlags::CGEventFlagAlphaShift;
-    }
-    if depressed.contains(XMods::ControlMask) {
-        flags |= CGEventFlags::CGEventFlagControl;
-    }
-    // Mod5 is ISO_Level3_Shift (AltGr on Linux); treat it as macOS Option key
-    if depressed.contains(XMods::Mod1Mask) || depressed.contains(XMods::Mod5Mask) {
-        flags |= CGEventFlags::CGEventFlagAlternate;
-    }
-    if depressed.contains(XMods::Mod4Mask) {
-        flags |= CGEventFlags::CGEventFlagCommand;
-    }
-    flags
-}
-
 bitflags! {
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     struct PhysicalModifiers: u16 {
@@ -1041,9 +1382,12 @@ bitflags! {
 #[cfg(test)]
 mod tests {
     use super::{
-        PhysicalModifiers, XMods, button_event_spec, commit_button_state, is_caps_lock,
-        set_modifiers, toggle_caps_lock, union_to_global, update_modifiers,
+        ModifierKinds, ModifierSides, PhysicalModifiers, XMods, button_event_spec, cg_event_flags,
+        commit_button_state, is_caps_lock, modifier_kinds, modifier_sides, set_modifiers,
+        toggle_caps_lock, union_to_global, update_modifiers,
     };
+    use crate::macos_keyboard::ModifierSide;
+    use core_graphics::event::CGEventFlags;
     use input_event::{
         BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT,
         scancode::Linux::{
@@ -1053,6 +1397,78 @@ mod tests {
     };
     use std::cell::Cell;
     use std::collections::HashSet;
+
+    /// `NX_DEVICERCTLKEYMASK`, the device-dependent right Control bit.
+    const NX_DEVICERCTLKEYMASK: u32 = 0x0000_2000;
+
+    #[test]
+    fn cg_event_fallback_keeps_the_device_dependent_modifier_bits() {
+        // `core-graphics` declares only the general modifier bits, so a
+        // truncating conversion would drop the side information the fallback
+        // needs to release one Control without clearing its peer.
+        let flags = crate::macos_keyboard::NX_CONTROLMASK | NX_DEVICERCTLKEYMASK;
+        assert_eq!(cg_event_flags(flags).bits(), u64::from(flags));
+        assert_ne!(
+            CGEventFlags::from_bits_truncate(u64::from(flags)).bits(),
+            u64::from(flags),
+            "core-graphics now declares the device bits; the comment above is stale"
+        );
+    }
+
+    #[test]
+    fn modifier_sides_mirror_the_physical_modifier_bits() {
+        for (physical, side) in [
+            (PhysicalModifiers::LEFT_SHIFT, ModifierSide::LeftShift),
+            (PhysicalModifiers::RIGHT_SHIFT, ModifierSide::RightShift),
+            (PhysicalModifiers::LEFT_CONTROL, ModifierSide::LeftControl),
+            (PhysicalModifiers::RIGHT_CONTROL, ModifierSide::RightControl),
+            (PhysicalModifiers::LEFT_OPTION, ModifierSide::LeftOption),
+            (PhysicalModifiers::RIGHT_OPTION, ModifierSide::RightOption),
+            (PhysicalModifiers::LEFT_COMMAND, ModifierSide::LeftCommand),
+            (PhysicalModifiers::RIGHT_COMMAND, ModifierSide::RightCommand),
+        ] {
+            assert_eq!(modifier_sides(physical), side.bit(), "{physical:?}");
+        }
+        assert_eq!(
+            modifier_sides(PhysicalModifiers::empty()),
+            ModifierSides::default()
+        );
+    }
+
+    #[test]
+    fn modifier_kinds_follow_the_aggregate_snapshot() {
+        assert_eq!(modifier_kinds(XMods::empty()).bits(), 0);
+        assert_eq!(
+            modifier_kinds(XMods::ShiftMask).bits(),
+            ModifierKinds::SHIFT.bits()
+        );
+        assert_eq!(
+            modifier_kinds(XMods::ControlMask).bits(),
+            ModifierKinds::CONTROL.bits()
+        );
+        assert_eq!(
+            modifier_kinds(XMods::Mod1Mask).bits(),
+            ModifierKinds::OPTION.bits()
+        );
+        // Mod5 is AltGr; the backend has always treated it as Option.
+        assert_eq!(
+            modifier_kinds(XMods::Mod5Mask).bits(),
+            ModifierKinds::OPTION.bits()
+        );
+        assert_eq!(
+            modifier_kinds(XMods::Mod4Mask).bits(),
+            ModifierKinds::COMMAND.bits()
+        );
+        // Caps Lock is not a modifier transition: macOS owns the locked bit,
+        // so it never reaches the injected flags.
+        assert_eq!(modifier_kinds(XMods::LockMask).bits(), 0);
+        assert_eq!(
+            modifier_kinds(XMods::ShiftMask | XMods::ControlMask | XMods::Mod4Mask).bits(),
+            ModifierKinds::SHIFT.bits()
+                | ModifierKinds::CONTROL.bits()
+                | ModifierKinds::COMMAND.bits()
+        );
+    }
 
     #[test]
     fn union_to_global_is_identity_when_the_primary_is_top_left() {

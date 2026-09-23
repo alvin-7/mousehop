@@ -53,6 +53,9 @@ pub enum EmulationError {
     #[cfg(target_os = "macos")]
     #[error("core-graphics error: {0}")]
     CoreGraphics(CGError),
+    #[cfg(target_os = "macos")]
+    #[error("macOS keyboard injection failed on both paths: status {0}")]
+    KeyboardInjection(i32),
 }
 
 #[derive(Debug, Error)]

@@ -756,3 +756,46 @@ works with Legacy and KCP; it does not change pointer movement or synthesize a
 second inertia curve. Windows applications may still render wheel scrolling
 differently from native macOS applications. Existing Mac receiver behavior is
 unchanged.
+
+### macOS keyboard injection
+
+The receiving Mac posts forwarded keys as real HID events
+(`NX_FLAGSCHANGED` for modifiers, `NX_KEYDOWN`/`NX_KEYUP` for ordinary keys),
+to support system shortcuts, including **Control+Left/Right Arrow** to switch
+desktops (Mac receiver, Windows controller). No Mousehop setting is
+involved: the shortcut is whatever macOS is configured for, and the Mac needs a
+desktop to move to. Modifier sides are preserved, so releasing one Control while
+the other is still held does not clear it, and Caps Lock is sent as one tap
+instead of a repeatable key.
+
+This path uses the same Accessibility and Input Control permissions Mousehop
+already asks for. If the `IOHIDSystem` service cannot be opened, or fails while
+input is being posted, Mousehop logs the failure, releases everything it
+injected, and continues with `CGEvent` posting; this fallback does not guarantee
+system shortcuts such as Control+Right Arrow. A key release that cannot be delivered on
+either path is reported as an emulation error instead of being silently held:
+the session stops rather than types on top of unconfirmed keyboard state.
+`IOHIDPostEvent` is deprecated by Apple as of
+macOS 11; it is isolated in one small C bridge
+(`input-emulation/src/nx_key_bridge.c`).
+
+When a Mac controls Windows, Command maps to Win by default. Enabling
+**Use Command as Control** for that peer maps Command to Ctrl instead.
+
+### Windows installer
+
+The Windows executable and installer embed the Mousehop icon. To build the
+per-user x64 installer, run from the repository root with the Rust toolchain,
+Windows SDK, GTK runtime/development bundle and Inno Setup available:
+
+```powershell
+./scripts/package-windows.ps1 -GtkRoot <gtk-directory> -InnoCompiler <ISCC.exe> `
+  -VCRuntimeRoot <vc-runtime-directory> -RuntimeLicenseDir <runtime-licenses>
+```
+
+The script produces `dist/windows-<version>-<timestamp>/Mousehop-<version>-x64-Setup.exe`.
+It packages runtime dependencies and licenses, without local diagnostic scripts.
+The installer displays **Mousehop**, creates a Start menu shortcut and offers a
+desktop shortcut. Existing KCP Test installations upgrade in place using their
+previous directory and installer identity; their old Start menu entries are replaced.
+Regenerate the Windows icon from the shared artwork with `scripts/makeico.ps1`.

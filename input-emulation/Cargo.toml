@@ -66,6 +66,13 @@ windows = { version = "0.61.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[build-dependencies]
+# Compiles `src/nx_key_bridge.c`, the only place that builds an SDK
+# `NXEventData` for `IOHIDPostEvent`. `build.rs` only invokes the compiler for
+# macOS targets, but the dependency itself has to be present on every host
+# because Cargo builds the script before it knows the target.
+cc = "1.2.59"
+
 [features]
 default = ["wlroots", "x11", "remote_desktop_portal", "libei"]
 wlroots = [
