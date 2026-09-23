@@ -341,6 +341,22 @@ impl Window {
                         ),
                     );
                     row.connect_closure(
+                        "request-scroll-inertia-change",
+                        false,
+                        closure_local!(
+                            #[strong]
+                            window,
+                            move |row: ClientRow, enabled: bool| {
+                                if let Some(client) = window.client_by_idx(row.index() as u32) {
+                                    window.request(FrontendRequest::SetClientScrollInertia(
+                                        client.handle(),
+                                        enabled,
+                                    ));
+                                }
+                            }
+                        ),
+                    );
+                    row.connect_closure(
                         "request-require-crossing-modifier-change",
                         false,
                         closure_local!(
@@ -518,6 +534,7 @@ impl Window {
         row.set_clipboard_send(client.clipboard_send);
         row.set_command_as_ctrl(client.command_as_ctrl);
         row.set_use_kcp(client.use_kcp);
+        row.set_scroll_inertia(client.scroll_inertia);
         row.set_crossing_modifier(client.require_crossing_modifier, client.crossing_modifier);
         if let Some(client_object) = self.client_object_for_handle(handle) {
             client_object.set_mode(client.mode);

@@ -33,6 +33,7 @@ use tokio::{
 
 fn to_pp(peer: &IncomingPeerConfig) -> ReceivePostProcessing {
     ReceivePostProcessing {
+        scroll_inertia: false,
         natural_scroll: peer.natural_scroll,
         mouse_sensitivity: peer.mouse_sensitivity,
     }
@@ -308,6 +309,7 @@ impl Emulation {
             request_rx,
             event_tx,
             addr_to_fingerprint: HashMap::new(),
+            scroll_inertia_sessions: HashMap::new(),
             incoming_peers: HashMap::new(),
             locked_hosts: HashSet::new(),
             latest_host_input_states: HashMap::new(),
@@ -382,6 +384,8 @@ struct ListenTask {
     /// Lets ListenTask resolve `IncomingPeerConfig` for an incoming
     /// peer without a per-packet round-trip into the listener.
     addr_to_fingerprint: HashMap<SocketAddr, String>,
+    /// Opt-in belongs to the authenticated connection, never a recycled address.
+    scroll_inertia_sessions: HashMap<SocketAddr, ListenerSession>,
     /// Latest authorized-peers map pushed by Service. Read on Accept
     /// and on `SetIncomingPeers` to build the per-handle
     /// `ReceivePostProcessing` snapshots that go into InputEmulation.
@@ -398,11 +402,17 @@ struct ListenTask {
 
 impl ListenTask {
     fn post_processing_for_addr(&self, addr: SocketAddr) -> ReceivePostProcessing {
-        self.addr_to_fingerprint
+        let mut pp = self
+            .addr_to_fingerprint
             .get(&addr)
             .and_then(|fp| self.incoming_peers.get(fp))
             .map(to_pp)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        pp.scroll_inertia = self
+            .scroll_inertia_sessions
+            .get(&addr)
+            .is_some_and(|session| self.session_is_current(addr, *session));
+        pp
     }
 
     fn session_is_current(&self, addr: SocketAddr, session: ListenerSession) -> bool {
@@ -1006,6 +1016,15 @@ impl ListenTask {
                                 ..
                             } => {
                                 peer_capabilities.insert((addr, session), capabilities);
+                                if self.session_is_current(addr, session) {
+                                    if capabilities & mousehop_proto::CAP_SCROLL_INERTIA_REQUEST != 0 {
+                                        self.scroll_inertia_sessions.insert(addr, session);
+                                    } else {
+                                        self.scroll_inertia_sessions.remove(&addr);
+                                    }
+                                    let pp = self.post_processing_for_addr(addr);
+                                    self.emulation_proxy.set_post_processing(addr, pp);
+                                }
                                 self.listener.reply(addr, session, ProtoEvent::hello(local_commit())).await;
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
                             }
@@ -1056,6 +1075,7 @@ impl ListenTask {
                         if let Some(receipt) = receipt { self.emulation_proxy.complete(receipt).await; }
                     }
                     Some(ListenEvent::Accept { addr, session, fingerprint }) => {
+                        self.scroll_inertia_sessions.remove(&addr);
                         // A reused UDP address is a distinct authenticated
                         // session. Do not let the old heartbeat make it look
                         // responsive before this connection speaks.
@@ -1088,6 +1108,9 @@ impl ListenTask {
                         }).expect("channel closed");
                     }
                     Some(ListenEvent::Disconnected { addr, session }) => {
+                        if self.scroll_inertia_sessions.get(&addr) == Some(&session) {
+                            self.scroll_inertia_sessions.remove(&addr);
+                        }
                         if last_response
                             .get(&addr)
                             .is_some_and(|(current, _)| *current == session)
@@ -2309,6 +2332,7 @@ mod lock_state_tests {
             (
                 disconnected,
                 ReceivePostProcessing {
+                    scroll_inertia: false,
                     natural_scroll: true,
                     mouse_sensitivity: 1.25,
                 },

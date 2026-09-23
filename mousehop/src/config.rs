@@ -125,6 +125,7 @@ struct TomlClient {
     command_as_ctrl: Option<bool>,
     #[serde(default)]
     use_kcp: Option<bool>,
+    scroll_inertia: Option<bool>,
     /// Per-outgoing-client edge-crossing gate. Absent in legacy configs and
     /// default-off, preserving automatic crossing.
     #[serde(default)]
@@ -356,6 +357,7 @@ pub struct ConfigClient {
     pub clipboard_send: bool,
     pub command_as_ctrl: bool,
     pub use_kcp: bool,
+    pub scroll_inertia: bool,
     pub require_crossing_modifier: bool,
     pub crossing_modifier: CrossingModifier,
 }
@@ -373,6 +375,7 @@ impl From<TomlClient> for ConfigClient {
         let clipboard_send = toml.clipboard_send.unwrap_or(false);
         let command_as_ctrl = toml.command_as_ctrl.unwrap_or(false);
         let use_kcp = toml.use_kcp.unwrap_or(false);
+        let scroll_inertia = toml.scroll_inertia.unwrap_or(false);
         let require_crossing_modifier = toml.require_crossing_modifier.unwrap_or(false);
         let crossing_modifier = toml.crossing_modifier.unwrap_or_default();
         Self {
@@ -387,6 +390,7 @@ impl From<TomlClient> for ConfigClient {
             clipboard_send,
             command_as_ctrl,
             use_kcp,
+            scroll_inertia,
             require_crossing_modifier,
             crossing_modifier,
         }
@@ -397,6 +401,7 @@ impl From<ConfigClient> for TomlClient {
     fn from(client: ConfigClient) -> Self {
         let hostname = client.hostname;
         let use_kcp = Some(client.use_kcp);
+        let scroll_inertia = client.scroll_inertia.then_some(true);
         let host_name = None;
         let mut ips = client.ips.into_iter().collect::<Vec<_>>();
         ips.sort();
@@ -450,6 +455,7 @@ impl From<ConfigClient> for TomlClient {
             clipboard_send,
             command_as_ctrl,
             use_kcp,
+            scroll_inertia,
             require_crossing_modifier,
             crossing_modifier,
         }
@@ -897,6 +903,7 @@ mod connection_mode_tests {
             clipboard_send: false,
             command_as_ctrl: false,
             use_kcp: false,
+            scroll_inertia: false,
             require_crossing_modifier: false,
             crossing_modifier: CrossingModifier::default(),
         }
@@ -1071,6 +1078,19 @@ use_kcp = true
             assert!(
                 toml::from_str::<ConfigToml>(&format!("kcp_peer_timeout_ms = {value}")).is_err()
             );
+        }
+    }
+
+    #[test]
+    fn scroll_inertia_is_default_off_and_roundtrips_per_device() {
+        let legacy: TomlClient = toml::from_str("hostname = 'windows'").unwrap();
+        assert!(!ConfigClient::from(legacy).scroll_inertia);
+        for enabled in [false, true] {
+            let mut client = client_with(ConnectionMode::default(), HashMap::new());
+            client.scroll_inertia = enabled;
+            let saved = toml::to_string(&TomlClient::from(client)).unwrap();
+            let reloaded: TomlClient = toml::from_str(&saved).unwrap();
+            assert_eq!(ConfigClient::from(reloaded).scroll_inertia, enabled);
         }
     }
 

@@ -741,3 +741,18 @@ the connection is available. A blocked backend keeps new injection closed and
 finishes cleanup only when its already-started operation returns. Automated tests
 and loopback DTLS checks do not establish Mac/Windows two-machine or real Wi-Fi
 acceptance; macOS receiving backends do not advertise this recovery capability.
+
+### Trackpad scroll inertia
+
+The receiving device's **Incoming Connections → Natural Scrolling** setting
+reverses both vertical and horizontal scrolling, including momentum scrolling.
+
+On the Mac controller, expand the Windows device under **Outgoing Connections**
+and enable **Scroll Inertia** to replay the Mac trackpad's momentum after lifting
+your fingers. It is off by default and saved per device as `scroll_inertia = true`
+inside that device's `[[clients]]` table. Both peers need this updated version.
+Changing the switch safely releases and reconnects only that device. The setting
+works with Legacy and KCP; it does not change pointer movement or synthesize a
+second inertia curve. Windows applications may still render wheel scrolling
+differently from native macOS applications. Existing Mac receiver behavior is
+unchanged.

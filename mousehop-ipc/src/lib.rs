@@ -388,6 +388,9 @@ pub struct ClientConfig {
     /// Effective outgoing preference. Incoming connections negotiate independently.
     #[serde(default)]
     pub use_kcp: bool,
+    /// Opt in to replaying source trackpad momentum on this outgoing connection.
+    #[serde(default)]
+    pub scroll_inertia: bool,
     /// When true, the pointer may enter this outgoing client only while
     /// [`Self::crossing_modifier`] is physically held. Default-off preserves
     /// the historical automatic edge crossing for existing configurations.
@@ -413,6 +416,7 @@ impl Default for ClientConfig {
             clipboard_send: false,
             command_as_ctrl: false,
             use_kcp: false,
+            scroll_inertia: false,
             require_crossing_modifier: false,
             crossing_modifier: CrossingModifier::default(),
         }
@@ -754,6 +758,7 @@ pub enum FrontendRequest {
     SetClientCommandAsCtrl(ClientHandle, bool),
     /// Persist this peer's transport preference and reconnect only this peer.
     SetClientUseKcp(ClientHandle, bool),
+    SetClientScrollInertia(ClientHandle, bool),
     /// Toggle whether crossing into an outgoing client requires its selected
     /// modifier to be held.
     SetClientRequireCrossingModifier(ClientHandle, bool),

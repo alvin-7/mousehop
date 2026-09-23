@@ -56,6 +56,19 @@ mod kcp_ui_tests {
             Some("KCP"),
             "preference is not session state"
         );
+        assert!(!row.imp().scroll_inertia_switch.is_active());
+        let inertia_count = Rc::new(Cell::new(0));
+        let seen = inertia_count.clone();
+        row.connect_local("request-scroll-inertia-change", false, move |_| {
+            seen.set(seen.get() + 1);
+            None
+        });
+        row.set_scroll_inertia(true);
+        assert!(row.imp().scroll_inertia_switch.is_active());
+        assert_eq!(inertia_count.get(), 0, "server updates must not echo");
+        row.imp().scroll_inertia_switch.set_active(false);
+        assert_eq!(inertia_count.get(), 1);
+        assert!(!row.imp().scroll_inertia_switch.is_active());
         row.unbind();
     }
 }
@@ -272,7 +285,27 @@ impl ClientRow {
         );
         bindings.push(
             client_object
+                .bind_property(
+                    "scroll-inertia",
+                    &self.imp().scroll_inertia_switch.get(),
+                    "state",
+                )
+                .sync_create()
+                .build(),
+        );
+        bindings.push(
+            client_object
                 .bind_property("use-kcp", &self.imp().use_kcp_switch.get(), "active")
+                .sync_create()
+                .build(),
+        );
+        bindings.push(
+            client_object
+                .bind_property(
+                    "scroll-inertia",
+                    &self.imp().scroll_inertia_switch.get(),
+                    "active",
+                )
                 .sync_create()
                 .build(),
         );
@@ -340,6 +373,10 @@ impl ClientRow {
 
     pub fn set_use_kcp(&self, value: bool) {
         self.imp().set_use_kcp(value);
+    }
+
+    pub fn set_scroll_inertia(&self, value: bool) {
+        self.imp().set_scroll_inertia(value);
     }
 
     pub fn set_crossing_modifier(&self, required: bool, modifier: CrossingModifier) {

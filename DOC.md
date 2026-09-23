@@ -85,6 +85,16 @@ Longer peer deadlines also delay releasing already-held input after total silenc
 Independent bounds remain: 6s transport negotiation, 300ms close cleanup, fixed
 queue/window budgets and the existing business handshake timeouts.
 
+Outgoing `ClientConfig.scroll_inertia` defaults to false and is persisted per
+device. The controller's authenticated Hello sets preference bit `1 << 4` only
+when enabled; KCP's Hello wrapping preserves it. The receiver scopes the opt-in
+to the current DTLS session and supplies it to receive post-processing. On a
+non-macOS receiver, default-off drops source momentum, while opt-in forwards the
+original deltas through the existing natural-scroll transform and OS backend.
+No event tag or existing wire layout changes; older peers ignore the new bit.
+The new IPC preference defaults to false when absent. Toggle changes use the
+same release barrier and targeted reconnect as the outgoing KCP switch, without
+affecting other devices. Both peers must be updated for this preference to work.
 Resource violations close the session. Negotiated input/queue-age stalls enter
 recovery; older KCP peers still close. See [reliable input configuration](README.md#experimental-reliable-input-over-dtls)
 for timeout settings, transport behavior and experimental limitations.

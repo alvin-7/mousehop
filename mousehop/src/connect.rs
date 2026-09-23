@@ -932,7 +932,15 @@ async fn connect_to_handle(
         // echoed Hello validates; `hello_handshake` retransmits until
         // then and tears the connection down if the window elapses.
         let hello_ok = Rc::new(Cell::new(false));
-        spawn_local(hello_handshake(addr, conn.clone(), hello_ok.clone()));
+        let scroll_inertia = client_manager
+            .get_state(handle)
+            .is_some_and(|(config, _)| config.scroll_inertia);
+        spawn_local(hello_handshake(
+            addr,
+            conn.clone(),
+            hello_ok.clone(),
+            scroll_inertia,
+        ));
 
         // poll connection for active
         spawn_local(ping_pong(
@@ -988,8 +996,15 @@ async fn hello_handshake(
     addr: SocketAddr,
     conn: Arc<dyn Conn + Send + Sync>,
     hello_ok: Rc<Cell<bool>>,
+    scroll_inertia: bool,
 ) {
-    let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::hello(local_commit()).into();
+    let mut hello = ProtoEvent::hello(local_commit());
+    if let ProtoEvent::Hello { capabilities, .. } = &mut hello {
+        if scroll_inertia {
+            *capabilities |= mousehop_proto::CAP_SCROLL_INERTIA_REQUEST;
+        }
+    }
+    let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = hello.into();
     for _ in 0..HELLO_MAX_ATTEMPTS {
         if hello_ok.get() {
             return;

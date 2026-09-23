@@ -23,6 +23,7 @@ pub struct ClientObject {
     #[property(name = "clipboard-send", get, set, type = bool, member = clipboard_send)]
     #[property(name = "command-as-ctrl", get, set, type = bool, member = command_as_ctrl)]
     #[property(name = "use-kcp", get, set, type = bool, member = use_kcp)]
+    #[property(name = "scroll-inertia", get, set, type = bool, member = scroll_inertia)]
     #[property(name = "transport-status", get, set, type = String, member = transport_status)]
     #[property(
         name = "require-crossing-modifier",

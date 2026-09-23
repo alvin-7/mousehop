@@ -40,6 +40,7 @@ impl ClientManager {
             clipboard_send: config_client.clipboard_send,
             command_as_ctrl: config_client.command_as_ctrl,
             use_kcp: config_client.use_kcp,
+            scroll_inertia: config_client.scroll_inertia,
             require_crossing_modifier: config_client.require_crossing_modifier,
             crossing_modifier: config_client.crossing_modifier,
         };
@@ -372,6 +373,16 @@ impl ClientManager {
         }
     }
 
+    pub(crate) fn set_scroll_inertia(&self, handle: ClientHandle, enabled: bool) -> bool {
+        match self.clients.borrow_mut().get_mut(handle as usize) {
+            Some((c, _)) if c.scroll_inertia != enabled => {
+                c.scroll_inertia = enabled;
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn set_transport_status(&self, handle: ClientHandle, status: &str) {
         if let Some((_, state)) = self.clients.borrow_mut().get_mut(handle as usize) {
             state.transport_status = status.to_owned();
@@ -680,6 +691,7 @@ mod tests {
             clipboard_send: false,
             command_as_ctrl: false,
             use_kcp: false,
+            scroll_inertia: false,
             require_crossing_modifier: false,
             crossing_modifier: CrossingModifier::default(),
         });

@@ -147,6 +147,19 @@
 		</child>
 		<child>
 			<object class="AdwActionRow">
+				<property name="title" translatable="yes">Scroll Inertia</property>
+				<property name="subtitle" translatable="yes">Continue trackpad scrolling after lifting your fingers. Off by default.</property>
+				<property name="tooltip-text" translatable="yes">Requires an updated receiver. Changing this setting reconnects this device.</property>
+				<property name="activatable">false</property>
+				<child type="suffix">
+					<object class="GtkSwitch" id="scroll_inertia_switch">
+						<property name="valign">center</property>
+					</object>
+				</child>
+			</object>
+		</child>
+		<child>
+			<object class="AdwActionRow">
 				<property name="title" translatable="yes">Share Clipboard With This Peer</property>
 				<property name="subtitle" translatable="yes">When you copy text on this device, send it to this peer.</property>
 				<!-- non-activatable so a click on the row doesn't

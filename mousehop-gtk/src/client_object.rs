@@ -50,6 +50,7 @@ impl ClientObject {
             .property("clipboard-send", client.clipboard_send)
             .property("command-as-ctrl", client.command_as_ctrl)
             .property("use-kcp", client.use_kcp)
+            .property("scroll-inertia", client.scroll_inertia)
             .property(
                 "transport-status",
                 if state.transport_status.is_empty() {
@@ -292,6 +293,7 @@ pub struct ClientData {
     pub clipboard_send: bool,
     pub command_as_ctrl: bool,
     pub use_kcp: bool,
+    pub scroll_inertia: bool,
     pub transport_status: String,
     pub require_crossing_modifier: bool,
     pub crossing_modifier: u32,

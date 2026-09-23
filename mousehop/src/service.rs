@@ -515,6 +515,35 @@ impl Service {
                     self.save_config().await;
                 }
             }
+            FrontendRequest::SetClientScrollInertia(handle, enabled) => {
+                if self.client_manager.get_state(handle).is_some() {
+                    if self.client_manager.set_scroll_inertia(handle, enabled) {
+                        let released = self.capture.release_client(handle).await;
+                        self.conn.reset_handle(handle).await;
+                        self.client_manager.set_transport_status(
+                            handle,
+                            if released {
+                                "Disconnected"
+                            } else {
+                                "Failed: input release not confirmed"
+                            },
+                        );
+                        if !released {
+                            self.deactivate_client(handle);
+                        }
+                        if released
+                            && self
+                                .client_manager
+                                .get_state(handle)
+                                .is_some_and(|(_, s)| s.active)
+                        {
+                            let _ = self.conn.send(ProtoEvent::Ping, handle).await;
+                        }
+                    }
+                    self.broadcast_client(handle);
+                    self.save_config().await;
+                }
+            }
             FrontendRequest::SetClientCommandAsCtrl(handle, enabled) => {
                 if self.client_manager.set_command_as_ctrl(handle, enabled) {
                     self.capture.set_command_as_ctrl(handle, enabled);
@@ -746,6 +775,7 @@ impl Service {
                 clipboard_send: c.clipboard_send,
                 command_as_ctrl: c.command_as_ctrl,
                 use_kcp: c.use_kcp,
+                scroll_inertia: c.scroll_inertia,
                 require_crossing_modifier: c.require_crossing_modifier,
                 crossing_modifier: c.crossing_modifier,
             })
