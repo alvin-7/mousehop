@@ -796,6 +796,7 @@ Windows SDK, GTK runtime/development bundle and Inno Setup available:
 The script produces `dist/windows-<version>-<timestamp>/Mousehop-<version>-x64-Setup.exe`.
 It packages runtime dependencies and licenses, without local diagnostic scripts.
 The installer displays **Mousehop**, creates a Start menu shortcut and offers a
-desktop shortcut. Existing KCP Test installations upgrade in place using their
-previous directory and installer identity; their old Start menu entries are replaced.
+desktop shortcut. Its installer identity is `com.mousehop.Mousehop`, matching
+the upstream application identifier, and its default directory is
+`%LOCALAPPDATA%\Programs\Mousehop`.
 Regenerate the Windows icon from the shared artwork with `scripts/makeico.ps1`.

@@ -9,8 +9,8 @@
 #endif
 
 [Setup]
-; Keep the existing installer identity so test installations upgrade in place.
-AppId=Mousehop-KCP-Test
+; Match the upstream Mousehop application identifier.
+AppId=com.mousehop.Mousehop
 AppName=Mousehop
 AppVersion={#AppVersion}
 DefaultDirName={localappdata}\Programs\Mousehop
@@ -33,11 +33,6 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
-
-[InstallDelete]
-Type: files; Name: "{userprograms}\Mousehop KCP Test.lnk"
-Type: files; Name: "{userprograms}\Uninstall Mousehop KCP Test.lnk"
-Type: files; Name: "{app}\Start-Keyboard-Logging.cmd"
 
 [Icons]
 Name: "{userprograms}\Mousehop"; Filename: "{app}\bin\mousehop.exe"; WorkingDir: "{app}\bin"; IconFilename: "{app}\bin\mousehop.exe"
