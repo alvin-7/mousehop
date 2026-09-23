@@ -39,7 +39,13 @@ iconset="${4:-./target/icon.iconset}"
 set -u
 
 workdir="$(dirname "$iconset")/icon-work"
-rm -rf "$iconset" "$workdir"
+if [ "${MOUSEHOP_FRESH_BUNDLE:-0}" = 1 ]; then
+    for output in "$iconset" "$workdir" "$icns" "$(dirname "$icns")/menubar-template.png"; do
+        [ ! -e "$output" ] || { echo "Refusing to overwrite $output" >&2; exit 1; }
+    done
+else
+    rm -rf "$iconset" "$workdir"
+fi
 mkdir -p "$iconset" "$workdir"
 
 # Big Sur+ macOS icon template proportions (in a 1024 canvas):
