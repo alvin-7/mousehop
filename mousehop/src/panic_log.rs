@@ -15,6 +15,33 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Preserve connection warnings even when LaunchServices discards stderr.
+/// Separate roles avoid GUI/daemon rotation races; each retains two 4MiB files.
+pub fn record_warning(role: &str, message: &str) {
+    let Some(mut path) = log_file_path() else {
+        return;
+    };
+    path.set_file_name(format!("connection-{role}.log"));
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    // Serialise warning writes and rotation within this process.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let Ok(_guard) = LOCK.lock() else {
+        return;
+    };
+    if fs::metadata(&path).is_ok_and(|m| m.len() >= 4 * 1024 * 1024) {
+        let backup = path.with_extension("previous.log");
+        let _ = fs::remove_file(&backup);
+        if fs::rename(&path, backup).is_err() {
+            return;
+        }
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{message}");
+    }
+}
+
 /// Install the panic-logging hook for this process. `role` is a short
 /// tag recorded in each entry (e.g. `"daemon"` or `"gui"`) so a shared
 /// logfile stays attributable. Best-effort: if the log directory can't
