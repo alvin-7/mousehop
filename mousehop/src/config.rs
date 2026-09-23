@@ -64,6 +64,12 @@ fn default_path() -> Result<PathBuf, VarError> {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 struct ConfigToml {
+    #[serde(default)]
+    input_transport: crate::transport::InputTransport,
+    #[serde(default)]
+    kcp_stall_timeout_ms: crate::transport::StallTimeout,
+    #[serde(default)]
+    kcp_peer_timeout_ms: crate::transport::PeerTimeout,
     capture_backend: Option<CaptureBackend>,
     emulation_backend: Option<EmulationBackend>,
     port: Option<u16>,
@@ -117,6 +123,8 @@ struct TomlClient {
     /// Absent in legacy configs and default-off.
     #[serde(default)]
     command_as_ctrl: Option<bool>,
+    #[serde(default)]
+    use_kcp: Option<bool>,
     /// Per-outgoing-client edge-crossing gate. Absent in legacy configs and
     /// default-off, preserving automatic crossing.
     #[serde(default)]
@@ -347,6 +355,7 @@ pub struct ConfigClient {
     pub network_locks: HashMap<String, IpAddr>,
     pub clipboard_send: bool,
     pub command_as_ctrl: bool,
+    pub use_kcp: bool,
     pub require_crossing_modifier: bool,
     pub crossing_modifier: CrossingModifier,
 }
@@ -363,6 +372,7 @@ impl From<TomlClient> for ConfigClient {
         let network_locks = toml.network_locks.unwrap_or_default();
         let clipboard_send = toml.clipboard_send.unwrap_or(false);
         let command_as_ctrl = toml.command_as_ctrl.unwrap_or(false);
+        let use_kcp = toml.use_kcp.unwrap_or(false);
         let require_crossing_modifier = toml.require_crossing_modifier.unwrap_or(false);
         let crossing_modifier = toml.crossing_modifier.unwrap_or_default();
         Self {
@@ -376,6 +386,7 @@ impl From<TomlClient> for ConfigClient {
             network_locks,
             clipboard_send,
             command_as_ctrl,
+            use_kcp,
             require_crossing_modifier,
             crossing_modifier,
         }
@@ -385,6 +396,7 @@ impl From<TomlClient> for ConfigClient {
 impl From<ConfigClient> for TomlClient {
     fn from(client: ConfigClient) -> Self {
         let hostname = client.hostname;
+        let use_kcp = Some(client.use_kcp);
         let host_name = None;
         let mut ips = client.ips.into_iter().collect::<Vec<_>>();
         ips.sort();
@@ -437,6 +449,7 @@ impl From<ConfigClient> for TomlClient {
             network_locks,
             clipboard_send,
             command_as_ctrl,
+            use_kcp,
             require_crossing_modifier,
             crossing_modifier,
         }
@@ -486,6 +499,8 @@ impl Config {
         }
 
         let config_toml = match ConfigToml::new(&config_path) {
+            // Invalid settings must not silently start a different transport policy.
+            Err(e @ ConfigError::Toml(_)) => return Err(e),
             Err(e) => {
                 log::warn!("{config_path:?}: {e}");
                 log::warn!("Continuing without config file ...");
@@ -586,11 +601,36 @@ impl Config {
     }
 
     /// the port to use (initially)
+    pub(crate) fn input_transport(&self) -> crate::transport::InputTransport {
+        self.config_toml
+            .as_ref()
+            .map(|c| c.input_transport)
+            .unwrap_or_default()
+    }
+
     pub fn port(&self) -> u16 {
         self.args
             .port
             .or(self.config_toml.as_ref().and_then(|c| c.port))
             .unwrap_or(DEFAULT_PORT)
+    }
+
+    pub(crate) fn kcp_stall_timeout(&self) -> crate::transport::StallTimeout {
+        self.config_toml
+            .as_ref()
+            .map(|c| c.kcp_stall_timeout_ms)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn kcp_timeouts(&self) -> crate::transport::Timeouts {
+        crate::transport::Timeouts {
+            stall: self.kcp_stall_timeout(),
+            peer: self
+                .config_toml
+                .as_ref()
+                .map(|c| c.kcp_peer_timeout_ms)
+                .unwrap_or_default(),
+        }
     }
 
     /// list of configured clients
@@ -601,7 +641,12 @@ impl Config {
             .unwrap_or_default()
             .into_iter()
             .flatten()
-            .map(From::<TomlClient>::from)
+            .map(|mut client| {
+                client.use_kcp = Some(client.use_kcp.unwrap_or(
+                    self.input_transport() == crate::transport::InputTransport::KcpRequired,
+                ));
+                ConfigClient::from(client)
+            })
             .collect()
     }
 
@@ -724,6 +769,12 @@ impl Config {
         let mut changed = false;
         match toml_edit::de::from_document::<ConfigToml>(current_config) {
             Ok(current_config) => {
+                if self.kcp_timeouts().peer != current_config.kcp_peer_timeout_ms {
+                    log::info!("kcp_peer_timeout_ms changed on disk; restart Mousehop to apply");
+                }
+                if self.kcp_stall_timeout() != current_config.kcp_stall_timeout_ms {
+                    log::info!("kcp_stall_timeout_ms changed on disk; restart Mousehop to apply");
+                }
                 changed = self
                     .config_toml
                     .as_ref()
@@ -784,6 +835,55 @@ mod connection_mode_tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
+    #[test]
+    fn kcp_timeout_default_bounds_and_save_roundtrip() {
+        let defaults: ConfigToml = toml::from_str("").unwrap();
+        assert_eq!(defaults.kcp_stall_timeout_ms.milliseconds(), 600);
+        assert_eq!(ConfigToml::default(), defaults);
+        for value in [1, 300, 1000, 60000] {
+            let mut config = config_with_no_clients();
+            config.config_toml =
+                Some(toml::from_str(&format!("kcp_stall_timeout_ms = {value}")).unwrap());
+            config.set_clients(vec![client_with(ConnectionMode::default(), HashMap::new())]);
+            let saved =
+                toml_edit::ser::to_string_pretty(config.config_toml.as_ref().unwrap()).unwrap();
+            let loaded: ConfigToml = toml::from_str(&saved).unwrap();
+            assert_eq!(loaded.kcp_stall_timeout_ms.milliseconds(), value);
+        }
+    }
+
+    #[test]
+    fn kcp_timeout_rejects_invalid_values() {
+        for value in [
+            "0",
+            "60001",
+            "-1",
+            "18446744073709551616",
+            "1.5",
+            "'300'",
+            "true",
+        ] {
+            let error = toml::from_str::<ConfigToml>(&format!("kcp_stall_timeout_ms = {value}"))
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("kcp_stall_timeout_ms"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_transport_requires_explicit_valid_selection() {
+        use crate::transport::InputTransport;
+        let legacy: ConfigToml = toml::from_str("").unwrap();
+        assert_eq!(legacy.input_transport, InputTransport::Legacy);
+        let required: ConfigToml = toml::from_str("input_transport = 'kcp-required'").unwrap();
+        assert_eq!(required.input_transport, InputTransport::KcpRequired);
+        let round_trip: ConfigToml = toml::from_str(&toml::to_string(&required).unwrap()).unwrap();
+        assert_eq!(round_trip.input_transport, InputTransport::KcpRequired);
+        assert!(toml::from_str::<ConfigToml>("input_transport = 'automatic'").is_err());
+    }
+
     fn client_with(mode: ConnectionMode, locks: HashMap<String, IpAddr>) -> ConfigClient {
         ConfigClient {
             ips: Default::default(),
@@ -796,6 +896,7 @@ mod connection_mode_tests {
             network_locks: locks,
             clipboard_send: false,
             command_as_ctrl: false,
+            use_kcp: false,
             require_crossing_modifier: false,
             crossing_modifier: CrossingModifier::default(),
         }
@@ -825,6 +926,43 @@ mod connection_mode_tests {
             watcher,
             watch_rx,
         }
+    }
+
+    #[test]
+    fn outgoing_kcp_inherits_old_default_but_explicit_false_survives_save() {
+        let mut config = config_with_no_clients();
+        config.config_toml = Some(
+            toml::from_str(
+                r#"
+input_transport = "kcp-required"
+[[clients]]
+hostname = "inherited"
+[[clients]]
+hostname = "disabled"
+use_kcp = false
+[[clients]]
+hostname = "enabled"
+use_kcp = true
+"#,
+            )
+            .unwrap(),
+        );
+        let clients = config.clients();
+        assert_eq!(
+            clients.iter().map(|c| c.use_kcp).collect::<Vec<_>>(),
+            vec![true, false, true]
+        );
+        config.set_clients(clients);
+        let saved = toml::to_string(config.config_toml.as_ref().unwrap()).unwrap();
+        config.config_toml = Some(toml::from_str(&saved).unwrap());
+        assert_eq!(
+            config
+                .clients()
+                .iter()
+                .map(|c| c.use_kcp)
+                .collect::<Vec<_>>(),
+            vec![true, false, true]
+        );
     }
 
     #[test]
@@ -899,6 +1037,41 @@ mod connection_mode_tests {
 
         let back: ConfigClient = toml.into();
         assert!(back.command_as_ctrl);
+    }
+
+    #[test]
+    fn peer_timeout_is_independent_validated_and_saved() {
+        let defaults: ConfigToml = toml::from_str("").unwrap();
+        assert_eq!(defaults.kcp_peer_timeout_ms.milliseconds(), 3000);
+        for value in [1, 1500, 5000, 60000] {
+            let mut config = config_with_no_clients();
+            config.config_toml = Some(
+                toml::from_str(&format!(
+                    "kcp_stall_timeout_ms = 250\nkcp_peer_timeout_ms = {value}"
+                ))
+                .unwrap(),
+            );
+            config.set_clients(vec![client_with(ConnectionMode::default(), HashMap::new())]);
+            let serialized =
+                toml_edit::ser::to_string_pretty(config.config_toml.as_ref().unwrap()).unwrap();
+            let loaded: ConfigToml = toml::from_str(&serialized).unwrap();
+            assert_eq!(loaded.kcp_stall_timeout_ms.milliseconds(), 250);
+            assert_eq!(loaded.kcp_peer_timeout_ms.milliseconds(), value);
+            assert_eq!(config.kcp_timeouts().peer.milliseconds(), value);
+        }
+        for value in [
+            "0",
+            "60001",
+            "-1",
+            "1.5",
+            "'1500'",
+            "true",
+            "18446744073709551616",
+        ] {
+            assert!(
+                toml::from_str::<ConfigToml>(&format!("kcp_peer_timeout_ms = {value}")).is_err()
+            );
+        }
     }
 
     #[test]

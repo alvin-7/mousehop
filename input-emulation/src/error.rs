@@ -27,6 +27,10 @@ use wayland_client::{
 
 #[derive(Debug, Error)]
 pub enum EmulationError {
+    #[error("backend cannot certify safe same-connection recovery")]
+    RecoveryUnsupported,
+    #[error("background input task failed: {0}")]
+    BackgroundTask(String),
     #[error("event stream closed")]
     EndOfStream,
     #[error("display topology is unavailable for an absolute cursor warp")]

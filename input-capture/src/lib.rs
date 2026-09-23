@@ -395,6 +395,45 @@ fn model_topology_motion(
 }
 
 impl InputCapture {
+    /// Freeze only the remote position model; continue pumping the backend so
+    /// physical releases are observable. This does not release or warp locally.
+    pub fn freeze_remote_model(&mut self) {
+        self.reset_wall_press_state();
+    }
+
+    /// Rebase to the receiver's actual global cursor, including negative
+    /// monitor origins. No OS cursor is injected or warped by this operation.
+    pub fn restore_remote_model(
+        &mut self,
+        pos: Position,
+        cursor: (f64, f64),
+        fingerprint: u64,
+    ) -> bool {
+        let Some(layout) = self.peer_layout(pos) else {
+            return false;
+        };
+        if layout.recovery_fingerprint() != fingerprint
+            || !cursor.0.is_finite()
+            || !cursor.1.is_finite()
+        {
+            return false;
+        }
+        let Some(origin) = layout.origin() else {
+            return false;
+        };
+        let relative = (
+            cursor.0 - f64::from(origin.0),
+            cursor.1 - f64::from(origin.1),
+        );
+        let Some(model) = model_topology_motion(layout, pos, relative, 0.0, 0.0) else {
+            return false;
+        };
+        self.reset_wall_press_state();
+        self.capture_pos = Some(pos);
+        self.virtual_cursor = Some(model.cursor);
+        self.virtual_pos = model.entry_distance;
+        true
+    }
     /// create a new client with the given id
     pub async fn create(&mut self, id: CaptureHandle, pos: Position) -> Result<(), CaptureError> {
         assert!(!self.id_map.contains_key(&id));
@@ -503,6 +542,11 @@ impl InputCapture {
     /// no need to recreate the backend.
     pub fn set_release_threshold(&mut self, threshold: u32) {
         self.release_threshold_px = threshold;
+        if threshold == 0 {
+            // Disabling must also cancel a previously armed fallback timer.
+            self.wall_press_pending = false;
+            self.wall_pressure = 0.0;
+        }
     }
 
     /// Cache the peer's display geometry for a position. Used by
@@ -1403,6 +1447,69 @@ async fn create(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn r13_recovery_rebases_negative_origin_without_accumulating_pause_motion() {
+        use super::*;
+        let mut capture = InputCapture::new(Some(Backend::Dummy)).await.unwrap();
+        let layout = DisplayLayout::new([(-1920, -200, 3840, 1280)]);
+        capture.set_peer_layout(Position::Right, 1, 1, layout.clone());
+        capture.freeze_remote_model();
+        capture.track_wall_press(
+            Position::Right,
+            &CaptureEvent::Input(Event::Pointer(PointerEvent::Motion {
+                time: 0,
+                dx: 800.0,
+                dy: -400.0,
+            })),
+        );
+        assert_eq!(capture.pending_motion, (0.0, 0.0));
+        assert!(capture.restore_remote_model(
+            Position::Right,
+            (-1000.0, 100.0),
+            layout.recovery_fingerprint()
+        ));
+        assert_eq!(capture.virtual_cursor, Some((920.0, 300.0)));
+        assert_eq!(capture.wall_pressure, 0.0);
+        assert!(!capture.restore_remote_model(
+            Position::Right,
+            (0.0, 0.0),
+            layout.recovery_fingerprint() ^ 1
+        ));
+    }
+    #[tokio::test]
+    async fn disabling_wall_fallback_cancels_an_already_armed_return() {
+        let mut capture = super::InputCapture::new(Some(super::Backend::Dummy))
+            .await
+            .unwrap();
+        capture.set_release_threshold(1);
+        capture.track_wall_press(
+            super::Position::Right,
+            &super::CaptureEvent::Begin {
+                cursor: None,
+                normalized_cursor: None,
+            },
+        );
+        let motion = super::CaptureEvent::Input(input_event::Event::Pointer(
+            input_event::PointerEvent::Motion {
+                time: 0,
+                dx: -10.0,
+                dy: 0.0,
+            },
+        ));
+        capture.track_wall_press(super::Position::Right, &motion);
+        assert!(capture.wall_press_pending);
+        capture.set_release_threshold(0);
+        assert!(!capture.wall_press_pending);
+        capture.track_wall_press(super::Position::Right, &motion);
+        assert!(!capture.wall_press_pending);
+        capture.set_release_threshold(1);
+        capture.track_wall_press(super::Position::Right, &motion);
+        assert!(
+            capture.wall_press_pending,
+            "legacy fallback can be restored"
+        );
+    }
+
     use super::{
         Backend, CaptureEvent, InputCapture, Position, model_topology_motion,
         normalize_cursor_in_layout, scale_motion, wrapping_generation_is_newer,

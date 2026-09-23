@@ -1,4 +1,7 @@
 use crate::config::local_commit;
+use crate::transport::lifecycle::Request as InputRecoveryRequest;
+use mousehop_proto::transport::recovery::Role as RecoveryRole;
+mod recovery;
 use crate::listen::{ListenEvent, ListenerCreationError, ListenerSession, MousehopListener};
 use futures::StreamExt;
 use input_emulation::{
@@ -14,6 +17,7 @@ use mousehop_proto::{
     CAP_TRANSACTIONAL_HANDOVER, HandoverWarpStatus, HostInputState, LEAVE_HANDOVER,
     LEAVE_RELEASE_ONLY, Position, ProtoEvent,
 };
+use recovery::{RecoveryRequest, RecoveryToken};
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
@@ -487,6 +491,8 @@ impl ListenTask {
     }
 
     async fn run(mut self) {
+        let mut recovery_tick = tokio::time::interval(Duration::from_millis(10));
+        recovery_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(5));
         let mut topology_interval = tokio::time::interval(Duration::from_secs(2));
         let mut leave_retry_interval = tokio::time::interval(Duration::from_millis(100));
@@ -511,24 +517,62 @@ impl ListenTask {
             .as_nanos() as u64;
         loop {
             select! {
+                _ = recovery_tick.tick() => {
+                    for (addr, session, link) in self.listener.recovery_links().await {
+                        if !self.session_is_current(addr, session) { continue; }
+                        let Some(request) = link.request() else { continue; };
+                        match request {
+                            InputRecoveryRequest::Barrier(round) => {
+                                if pending_leaves.keys().any(|(a, s, _)| *a == addr && *s == session) {
+                                    link.barrier_done(round, Err(()));
+                                    continue;
+                                }
+                                match self.emulation_proxy.recovery_barrier(addr, round.session(), round.next_epoch()) {
+                                    Ok((_token, pending)) => {
+                                        spawn_local(async move {
+                                            let result = pending.await.ok().and_then(Result::ok).and_then(|baseline| {
+                                                link.baseline(f64::from(baseline.cursor.0), f64::from(baseline.cursor.1), baseline.layout.recovery_fingerprint())
+                                            }).ok_or(());
+                                            link.barrier_done(round, result);
+                                        });
+                                    }
+                                    Err(error) => {
+                                        log::warn!("input recovery barrier unavailable for {addr}: {error}");
+                                        link.barrier_done(round, Err(()));
+                                    }
+                                }
+                            }
+                            InputRecoveryRequest::Install { round, .. } => {
+                                let result = self.emulation_proxy.recovery_tokens.borrow().get(&addr).is_some_and(|token| {
+                                    token.session == round.session() && token.epoch == round.next_epoch()
+                                        && link.generation().is_some_and(|generation| token.bind(generation)) && token.activate()
+                                });
+                                link.installed(round, result.then_some(()).ok_or(()));
+                            }
+                            InputRecoveryRequest::Resumed { .. } => {},
+                        }
+                    }
+                }
                 e = self.listener.next() => {match e {
-                    Some(ListenEvent::Msg { event, addr, session }) => {
+                    Some(ListenEvent::Msg { event, addr, session, receipt }) => {
                         log::trace!("{event} <-<-<-<-<- {addr} session {session}");
                         last_response.insert(addr, (session, Instant::now()));
+                        'processing: {
+                        if receipt.as_ref().is_some_and(|r| !r.valid()) { break 'processing; }
                         match event {
                             ProtoEvent::Enter(pos) => {
                                 if !remote_input_allowed(&self.locked_hosts, addr) {
                                     log::debug!("dropping Enter from locked host {addr}");
                                 } else if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr, session).await {
                                     if !self.session_is_current(addr, session) {
-                                        continue;
+                                        break 'processing;
                                     }
                                     log::info!("releasing capture before legacy entry from {addr} session {session}");
                                     if !self.request_capture_release().await
                                         || !self.session_is_current(addr, session)
                                     {
                                         log::debug!("legacy entry was superseded while capture released");
-                                        continue;
+                                        break 'processing;
                                     }
                                     // A lost prior Leave must not let a fresh
                                     // crossing inherit held keys in the existing
@@ -551,7 +595,7 @@ impl ListenTask {
                                         topology_epoch,
                                         topology_generation,
                                     ).await {
-                                        continue;
+                                        break 'processing;
                                     }
                                     legacy_enter_ready.insert((addr, session));
                                     input_owner_sessions.insert((addr, session), 0);
@@ -579,7 +623,7 @@ impl ListenTask {
                                     });
                                 if !remote_input_allowed(&self.locked_hosts, addr) {
                                     log::debug!("dropping handover {serial} from locked host {addr}");
-                                    continue;
+                                    break 'processing;
                                 }
                                 match classify_handover(
                                     completed_handovers.get(&key).map(|completed| completed.serial),
@@ -596,7 +640,7 @@ impl ListenTask {
                                             log::debug!(
                                                 "withholding Ack for revoked handover {serial} from {addr} session {session}"
                                             );
-                                            continue;
+                                            break 'processing;
                                         }
                                         let completed = completed_handovers
                                             .get(&key)
@@ -630,25 +674,29 @@ impl ListenTask {
                                             )
                                             .await;
                                         }
-                                        continue;
+                                        break 'processing;
                                     }
                                     HandoverDisposition::DropStale => {
                                         log::debug!(
                                             "dropping stale handover {serial} from {addr} session {session}"
                                         );
-                                        continue;
+                                        break 'processing;
                                     }
-                                    HandoverDisposition::Apply => {}
+                                    HandoverDisposition::Apply => {
+                                        if let Some(link) = self.listener.recovery_link(addr, session).await {
+                                            link.ownership(None, RecoveryRole::Acceptor);
+                                        }
+                                    }
                                 }
                                 let Some(fingerprint) = self
                                     .listener
                                     .get_certificate_fingerprint(addr, session)
                                     .await
                                 else {
-                                    continue;
+                                    break 'processing;
                                 };
                                 if !self.session_is_current(addr, session) {
-                                    continue;
+                                    break 'processing;
                                 }
                                 log::info!(
                                     "releasing capture before atomic handover {serial} from {addr} session {session}"
@@ -659,7 +707,7 @@ impl ListenTask {
                                     log::debug!(
                                         "handover {serial} was superseded while capture released"
                                     );
-                                    continue;
+                                    break 'processing;
                                 }
                                 // Never carry pressed-key state from a prior
                                 // crossing into this newer transaction when its
@@ -669,7 +717,7 @@ impl ListenTask {
                                     let edge = entry_edge(pos);
                                     match self
                                         .emulation_proxy
-                                        .warp_cursor_to_edge(edge, f64::from(cross_fraction))
+                                        .warp_cursor_to_edge(addr, edge, f64::from(cross_fraction), receipt.clone())
                                         .await
                                     {
                                         Some(EdgeWarpOutcome::Applied(layout)) => {
@@ -687,7 +735,7 @@ impl ListenTask {
                                             log::warn!(
                                                 "handover {serial} cursor warp did not complete; withholding Ack"
                                             );
-                                            continue;
+                                            break 'processing;
                                         }
                                     }
                                 } else {
@@ -697,7 +745,7 @@ impl ListenTask {
                                     )
                                 };
                                 if !self.session_is_current(addr, session) {
-                                    continue;
+                                    break 'processing;
                                 }
                                 let pp = self.post_processing_for_addr(addr);
                                 let bounds = layout.as_ref().and_then(DisplayLayout::size);
@@ -716,9 +764,12 @@ impl ListenTask {
                                     topology_epoch,
                                     topology_generation,
                                 ).await {
-                                    continue;
+                                    break 'processing;
                                 }
                                 input_owner_sessions.insert(key, serial);
+                                if let Some(link) = self.listener.recovery_link(addr, session).await {
+                                    link.ownership(Some(serial), RecoveryRole::Acceptor);
+                                }
                                 completed_handovers.insert(
                                     key,
                                     CompletedHandover {
@@ -794,6 +845,9 @@ impl ListenTask {
                                     self.emulation_proxy.remove(addr);
                                     legacy_enter_ready.remove(&key);
                                     input_owner_sessions.remove(&key);
+                                    if let Some(link) = self.listener.recovery_link(addr, session).await {
+                                        link.ownership(Some(serial), RecoveryRole::Dialer);
+                                    }
                                 }
                                 self.listener
                                     .reply(
@@ -805,6 +859,9 @@ impl ListenTask {
                             }
                             ProtoEvent::HandoverLeaveAck { serial } => {
                                 pending_leaves.remove(&(addr, session, serial));
+                                if let Some(link) = self.listener.recovery_link(addr, session).await {
+                                    link.ownership(Some(serial), RecoveryRole::Dialer);
+                                }
                             }
                             ProtoEvent::Input(event) => {
                                 let transactional = peer_capabilities
@@ -826,7 +883,7 @@ impl ListenTask {
                                         "dropping input without active ownership from {addr} session {session}"
                                     );
                                 } else {
-                                    self.emulation_proxy.consume(event, addr);
+                                    self.emulation_proxy.consume_checked(event, addr, receipt.clone());
                                 }
                             }
                             ProtoEvent::HandoverInput { serial, event } => {
@@ -838,7 +895,7 @@ impl ListenTask {
                                     serial,
                                 ) == TransactionalInputDisposition::Consume
                                 {
-                                    self.emulation_proxy.consume(event, addr);
+                                    self.emulation_proxy.consume_checked(event, addr, receipt.clone());
                                 } else {
                                     log::debug!(
                                         "rejecting input for unowned handover {serial} from {addr} session {session}"
@@ -989,12 +1046,14 @@ impl ListenTask {
                                     );
                                     let _ = self
                                         .emulation_proxy
-                                        .warp_cursor_to_edge(edge, f64::from(cross_fraction))
+                                        .warp_cursor_to_edge(addr, edge, f64::from(cross_fraction), receipt.clone())
                                         .await;
                                 }
                             }
                             _ => {}
                         }
+                        }
+                        if let Some(receipt) = receipt { self.emulation_proxy.complete(receipt).await; }
                     }
                     Some(ListenEvent::Accept { addr, session, fingerprint }) => {
                         // A reused UDP address is a distinct authenticated
@@ -1060,6 +1119,7 @@ impl ListenTask {
                     None => break
                 }}
                 event = self.emulation_proxy.event() => {
+                    self.listener.set_recovery_available(self.emulation_proxy.recovery_supported.get() && self.emulation_proxy.emulation_active.get());
                     self.event_tx.send(event).expect("channel closed");
                 }
                 request = self.request_rx.recv() => match request.expect("channel closed") {
@@ -1092,6 +1152,9 @@ impl ListenTask {
                                     capabilities & CAP_TRANSACTIONAL_HANDOVER != 0
                                 });
                             if let Some(serial) = serial.filter(|_| transactional) {
+                                if let Some(link) = self.listener.recovery_link(addr, session).await {
+                                    link.ownership(None, RecoveryRole::Dialer);
+                                }
                                 pending_leaves.insert((addr, session, serial), mode);
                                 self.listener
                                     .reply(
@@ -1155,6 +1218,12 @@ impl ListenTask {
                         }
                         last_response.remove(&addr);
                         if !self.session_is_current(addr, session) {
+                            continue;
+                        }
+                        if self.listener.recovery_link(addr, session).await.is_some() {
+                            // Negotiated sessions use the transport's peer and
+                            // recovery deadlines, including the normal phase.
+                            last_response.insert(addr, (session, Instant::now()));
                             continue;
                         }
 
@@ -1274,6 +1343,9 @@ impl ListenTask {
 /// proxy handling the actual input emulation,
 /// discarding events when it is disabled
 pub(crate) struct EmulationProxy {
+    recovery_supported: Rc<Cell<bool>>,
+    recovery_tx: tokio::sync::mpsc::Sender<RecoveryRequest>,
+    recovery_tokens: Rc<RefCell<HashMap<SocketAddr, RecoveryToken>>>,
     emulation_active: Rc<Cell<bool>>,
     exit_requested: Rc<Cell<bool>>,
     request_tx: Sender<ProxyRequest>,
@@ -1290,7 +1362,14 @@ pub(crate) struct EmulationProxy {
 }
 
 enum ProxyRequest {
-    Input(Event, SocketAddr),
+    EpochInput(
+        Event,
+        RecoveryToken,
+        oneshot::Sender<Result<(), input_emulation::EmulationError>>,
+        Option<crate::transport::Receipt>,
+    ),
+    Input(Event, SocketAddr, Option<crate::transport::Receipt>),
+    Barrier(oneshot::Sender<()>),
     Remove(SocketAddr),
     /// Terminal DTLS teardown. Unlike `Remove`, also discard per-address
     /// settings because a reconnect normally arrives from a new ephemeral
@@ -1301,7 +1380,13 @@ enum ProxyRequest {
     /// Warp the local cursor to an absolute position. Used on
     /// `Enter` to seat the cursor at the entry edge so the
     /// capturing peer's wall-press model is synchronized.
-    WarpToEdge(DisplayEdge, f64, oneshot::Sender<Option<EdgeWarpOutcome>>),
+    WarpToEdge(
+        SocketAddr,
+        DisplayEdge,
+        f64,
+        oneshot::Sender<Option<EdgeWarpOutcome>>,
+        Option<crate::transport::Receipt>,
+    ),
     /// Query and cache a fresh topology snapshot on the emulation task. Entry
     /// metadata uses this instead of the periodic cache so a hotplug cannot
     /// split cursor placement and advertised geometry across generations.
@@ -1316,6 +1401,9 @@ enum ProxyRequest {
 
 impl EmulationProxy {
     fn new(backend: Option<input_emulation::Backend>) -> Self {
+        let recovery_supported = Rc::new(Cell::new(false));
+        let (recovery_tx, recovery_rx) = tokio::sync::mpsc::channel(16);
+        let recovery_tokens = Rc::new(RefCell::new(HashMap::new()));
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_active = Rc::new(Cell::new(false));
@@ -1323,6 +1411,9 @@ impl EmulationProxy {
         let display_bounds = Rc::new(Cell::new(None));
         let display_layout = Rc::new(RefCell::new(None));
         let emulation_task = EmulationTask {
+            recovery_supported: recovery_supported.clone(),
+            recovery_rx,
+            recovery_tokens: recovery_tokens.clone(),
             backend,
             exit_requested: exit_requested.clone(),
             display_bounds: display_bounds.clone(),
@@ -1335,6 +1426,9 @@ impl EmulationProxy {
         };
         let task = spawn_local(emulation_task.run());
         Self {
+            recovery_supported,
+            recovery_tx,
+            recovery_tokens,
             emulation_active,
             exit_requested,
             request_tx,
@@ -1361,8 +1455,10 @@ impl EmulationProxy {
     /// cannot flush input while the cursor still belongs to the old screen.
     pub(crate) async fn warp_cursor_to_edge(
         &self,
+        addr: SocketAddr,
         edge: DisplayEdge,
         cross_fraction: f64,
+        receipt: Option<crate::transport::Receipt>,
     ) -> Option<EdgeWarpOutcome> {
         if !self.emulation_active.get() {
             return None;
@@ -1370,7 +1466,13 @@ impl EmulationProxy {
         let (completion, completed) = oneshot::channel();
         if self
             .request_tx
-            .send(ProxyRequest::WarpToEdge(edge, cross_fraction, completion))
+            .send(ProxyRequest::WarpToEdge(
+                addr,
+                edge,
+                cross_fraction,
+                completion,
+                receipt,
+            ))
             .is_err()
         {
             return None;
@@ -1424,18 +1526,102 @@ impl EmulationProxy {
         // ignore events if emulation is currently disabled
         if self.emulation_active.get() {
             self.request_tx
-                .send(ProxyRequest::Input(event, addr))
+                .send(ProxyRequest::Input(event, addr, None))
                 .expect("channel closed");
         }
     }
 
+    fn consume_checked(
+        &self,
+        event: Event,
+        addr: SocketAddr,
+        receipt: Option<crate::transport::Receipt>,
+    ) {
+        if let Some(generation) = receipt
+            .as_ref()
+            .and_then(crate::transport::Receipt::generation)
+            .cloned()
+        {
+            if !generation.valid() {
+                return;
+            }
+            let current = self.recovery_tokens.borrow().get(&addr).cloned();
+            let token = match current {
+                Some(token)
+                    if token.session == generation.session
+                        && token.epoch == generation.epoch
+                        && !token.retired() =>
+                {
+                    token
+                }
+                old if generation.epoch == 0
+                    || old.as_ref().is_some_and(|t| {
+                        t.session == generation.session && t.epoch == generation.epoch
+                    }) =>
+                {
+                    let token = RecoveryToken::new(addr, generation.session, generation.epoch);
+                    token.bind(generation);
+                    token.prepare();
+                    token.activate();
+                    if let Some(old) = self
+                        .recovery_tokens
+                        .borrow_mut()
+                        .insert(addr, token.clone())
+                    {
+                        old.retire();
+                    }
+                    token
+                }
+                _ => {
+                    if let Some(receipt) = receipt {
+                        receipt.abort();
+                    }
+                    return;
+                }
+            };
+            let pending = self.consume_epoch(event, &token, receipt.clone());
+            spawn_local(async move {
+                if !matches!(pending.await, Ok(Ok(()))) {
+                    if let Some(receipt) = receipt {
+                        if receipt.valid() {
+                            receipt.abort();
+                        } else {
+                            receipt.expire();
+                        }
+                    }
+                }
+            });
+            return;
+        }
+        if self.emulation_active.get() {
+            let _ = self
+                .request_tx
+                .send(ProxyRequest::Input(event, addr, receipt));
+        } else if let Some(receipt) = receipt {
+            receipt.abort();
+        }
+    }
+
+    async fn complete(&self, receipt: crate::transport::Receipt) {
+        let (tx, rx) = oneshot::channel();
+        if self.request_tx.send(ProxyRequest::Barrier(tx)).is_ok() {
+            receipt.after(rx).await;
+        }
+    }
+
     fn remove(&self, addr: SocketAddr) {
+        if let Some(token) = self.recovery_tokens.borrow().get(&addr) {
+            token.retire();
+        }
         self.request_tx
             .send(ProxyRequest::Remove(addr))
             .expect("channel closed");
     }
 
     fn forget(&self, addr: SocketAddr) {
+        if let Some(token) = self.recovery_tokens.borrow_mut().remove(&addr) {
+            token.retire();
+        }
         self.request_tx
             .send(ProxyRequest::Forget(addr))
             .expect("channel closed");
@@ -1448,6 +1634,9 @@ impl EmulationProxy {
     }
 
     async fn terminate(&mut self) {
+        for token in self.recovery_tokens.borrow().values() {
+            token.retire();
+        }
         self.exit_requested.replace(true);
         self.request_tx
             .send(ProxyRequest::Terminate)
@@ -1456,7 +1645,91 @@ impl EmulationProxy {
     }
 }
 
+impl EmulationProxy {
+    /// Freeze immediately, then request serial cleanup over a bounded channel
+    /// independent of the legacy data backlog. Failure keeps the gate closed.
+    pub(crate) fn recovery_barrier(
+        &self,
+        addr: SocketAddr,
+        session: [u8; 16],
+        epoch: u64,
+    ) -> Result<
+        (
+            RecoveryToken,
+            oneshot::Receiver<
+                Result<input_emulation::RecoveryBaseline, input_emulation::EmulationError>,
+            >,
+        ),
+        input_emulation::EmulationError,
+    > {
+        let token = RecoveryToken::new(addr, session, epoch);
+        if self
+            .recovery_tokens
+            .borrow()
+            .get(&addr)
+            .is_some_and(|old| old.session == session && old.epoch >= epoch)
+        {
+            return Err(input_emulation::EmulationError::Io(std::io::Error::other(
+                "recovery epoch must advance; reuse the pending barrier for retries",
+            )));
+        }
+        if let Some(old) = self
+            .recovery_tokens
+            .borrow_mut()
+            .insert(addr, token.clone())
+        {
+            old.retire();
+        }
+        if !self.emulation_active.get() {
+            return Err(input_emulation::EmulationError::EndOfStream);
+        }
+        let (done, completed) = oneshot::channel();
+        self.recovery_tx
+            .try_send(RecoveryRequest {
+                token: token.clone(),
+                done,
+            })
+            .map_err(|_| {
+                input_emulation::EmulationError::Io(std::io::Error::other(
+                    "recovery management channel unavailable",
+                ))
+            })?;
+        Ok((token, completed))
+    }
+
+    pub(crate) fn consume_epoch(
+        &self,
+        event: Event,
+        token: &RecoveryToken,
+        receipt: Option<crate::transport::Receipt>,
+    ) -> oneshot::Receiver<Result<(), input_emulation::EmulationError>> {
+        let (done, completed) = oneshot::channel();
+        if !token.valid()
+            || receipt.as_ref().is_some_and(|r| !r.valid())
+            || !self.emulation_active.get()
+            || !self
+                .recovery_tokens
+                .borrow()
+                .get(&token.addr)
+                .is_some_and(|current| current.same(token))
+        {
+            let _ = done.send(Err(input_emulation::EmulationError::EndOfStream));
+        } else {
+            let _ = self.request_tx.send(ProxyRequest::EpochInput(
+                event,
+                token.clone(),
+                done,
+                receipt,
+            ));
+        }
+        completed
+    }
+}
+
 struct EmulationTask {
+    recovery_supported: Rc<Cell<bool>>,
+    recovery_rx: tokio::sync::mpsc::Receiver<RecoveryRequest>,
+    recovery_tokens: Rc<RefCell<HashMap<SocketAddr, RecoveryToken>>>,
     backend: Option<input_emulation::Backend>,
     exit_requested: Rc<Cell<bool>>,
     /// Shared cache; refreshed each time we (re)create the inner
@@ -1488,20 +1761,43 @@ impl EmulationTask {
             if let Err(e) = self.do_emulation().await {
                 log::warn!("input emulation exited: {e}");
             }
+            for token in self.recovery_tokens.borrow().values() {
+                token.retire();
+            }
+            while let Ok(request) = self.recovery_rx.try_recv() {
+                let _ = request
+                    .done
+                    .send(Err(input_emulation::EmulationError::EndOfStream));
+            }
             if self.exit_requested.get() {
                 break;
             }
             // wait for reenable request
             loop {
-                match self.request_rx.recv().await.expect("channel closed") {
+                let request = tokio::select! {
+                    Some(request) = self.recovery_rx.recv() => {
+                        request.token.retire();
+                        let _ = request.done.send(Err(input_emulation::EmulationError::EndOfStream));
+                        continue;
+                    }
+                    request = self.request_rx.recv() => request.expect("channel closed"),
+                };
+                match request {
                     ProxyRequest::Reenable => break,
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::EpochInput(_, token, done, _) => {
+                        token.retire();
+                        let _ = done.send(Err(input_emulation::EmulationError::EndOfStream));
+                    }
+                    ProxyRequest::Barrier(done) => {
+                        drop(done); // A stopped backend cannot certify consumption.
+                    }
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::Forget(addr) => {
                         forget_peer_state(&mut self.handles, &mut self.post_processing, addr);
                     }
-                    ProxyRequest::WarpToEdge(_, _, completion) => {
+                    ProxyRequest::WarpToEdge(_, _, _, completion, _) => {
                         let _ = completion.send(None);
                     }
                     ProxyRequest::RefreshDisplayLayout(completion) => {
@@ -1536,6 +1832,7 @@ impl EmulationTask {
         // initialize from two different monitor arrangements.
         let layout = emulation.display_layout();
         self.cache_display_layout(layout);
+        self.recovery_supported.set(emulation.recovery_available());
 
         // Re-apply per-handle post-processing for any handles we
         // already had before the backend was (re)created. New
@@ -1568,6 +1865,9 @@ impl EmulationTask {
         }
 
         let res = self.do_emulation_session(&mut emulation).await;
+        for token in self.recovery_tokens.borrow().values() {
+            token.retire();
+        }
         // FIXME replace with async drop when stabilized
         emulation.terminate().await;
         res
@@ -1622,6 +1922,26 @@ impl EmulationTask {
         let mut bounds_poll = tokio::time::interval(Duration::from_secs(2));
         loop {
             tokio::select! {
+                biased;
+                Some(request) = self.recovery_rx.recv() => {
+                    if !request.token.frozen() {
+                        let _ = request.done.send(Err(input_emulation::EmulationError::EndOfStream));
+                        continue;
+                    }
+                    let addr = request.token.addr;
+                    let handle = match self.handles.get(&addr) {
+                        Some(&handle) => handle,
+                        None => {
+                            let handle = self.next_id;
+                            self.next_id += 1;
+                            emulation.create(handle).await;
+                            self.handles.insert(addr, handle);
+                            if let Some(&pp) = self.post_processing.get(&addr) { emulation.set_post_processing(handle, pp); }
+                            handle
+                        }
+                    };
+                    request.execute(emulation, handle).await;
+                }
                 _ = bounds_poll.tick() => {
                     let current_layout = emulation.display_layout();
                     let current_bounds = current_layout.as_ref().and_then(DisplayLayout::size);
@@ -1638,7 +1958,37 @@ impl EmulationTask {
                     }
                 }
                 e = self.request_rx.recv() => match e.expect("channel closed") {
-                    ProxyRequest::Input(event, addr) => {
+                    ProxyRequest::Barrier(done) => { let _ = done.send(()); }
+                    ProxyRequest::EpochInput(event, token, done, receipt) => {
+                        if !token.valid() || receipt.as_ref().is_some_and(|r| !r.valid()) {
+                            if let Some(receipt) = receipt { receipt.expire(); }
+                            let _ = done.send(Err(input_emulation::EmulationError::EndOfStream));
+                            continue;
+                        }
+                        let handle = match self.handles.get(&token.addr) {
+                            Some(&handle) => handle,
+                            None => {
+                                let handle = self.next_id;
+                                self.next_id += 1;
+                                emulation.create(handle).await;
+                                self.handles.insert(token.addr, handle);
+                                if let Some(&pp) = self.post_processing.get(&token.addr) { emulation.set_post_processing(handle, pp); }
+                                handle
+                            }
+                        };
+                        let result = if token.valid() && receipt.as_ref().is_none_or(|r| r.valid()) { emulation.consume(event, handle).await }
+                            else { Err(input_emulation::EmulationError::EndOfStream) };
+                        if result.is_err() { token.retire(); }
+                        let result = if token.valid() { result } else {
+                            result.and(Err(input_emulation::EmulationError::EndOfStream))
+                        };
+                        let _ = done.send(result);
+                    }
+                    ProxyRequest::Input(event, addr, receipt) => {
+                        // A managed address cannot bypass its epoch gate via
+                        // legacy requests queued before recovery began.
+                        if self.recovery_tokens.borrow().contains_key(&addr) && !matches!(event, Event::Clipboard(_)) { continue; }
+                        if receipt.as_ref().is_some_and(|r| !r.valid()) { continue; }
                         let handle = match self.handles.get(&addr) {
                             Some(&handle) => handle,
                             None => {
@@ -1655,9 +2005,14 @@ impl EmulationTask {
                                 handle
                             }
                         };
-                        emulation.consume(event, handle).await?;
+                        if receipt.as_ref().is_some_and(|r| !r.valid()) { continue; }
+                        if let Err(error) = emulation.consume(event, handle).await {
+                            if let Some(receipt) = receipt { receipt.abort(); }
+                            return Err(error.into());
+                        }
                     },
                     ProxyRequest::Remove(addr) => {
+                        if self.recovery_tokens.borrow().get(&addr).is_some_and(|t| !t.retired()) { continue; }
                         if let Some(handle) = self.handles.remove(&addr) {
                             emulation.destroy(handle).await;
                         }
@@ -1677,6 +2032,7 @@ impl EmulationTask {
                         // entry doesn't shadow a fresh one.
                     }
                     ProxyRequest::Forget(addr) => {
+                        if self.recovery_tokens.borrow().contains_key(&addr) { continue; }
                         if let Some(handle) = forget_peer_state(
                             &mut self.handles,
                             &mut self.post_processing,
@@ -1685,7 +2041,15 @@ impl EmulationTask {
                             emulation.destroy(handle).await;
                         }
                     }
-                    ProxyRequest::WarpToEdge(edge, cross_fraction, completion) => {
+                    ProxyRequest::WarpToEdge(addr, edge, cross_fraction, completion, receipt) => {
+                        if self.recovery_tokens.borrow().get(&addr).is_some_and(|t| !t.retired()) {
+                            let _ = completion.send(None);
+                            continue;
+                        }
+                        if receipt.as_ref().is_some_and(|r| !r.valid()) {
+                            let _ = completion.send(None);
+                            continue;
+                        }
                         let result = emulation.warp_cursor_to_edge(edge, cross_fraction).await;
                         let outcome = match result {
                             Ok(EdgeWarpOutcome::Applied(layout)) => {
@@ -1747,14 +2111,21 @@ async fn wait_for_termination(
     loop {
         match rx.recv().await.expect("channel closed") {
             ProxyRequest::Terminate => return,
-            ProxyRequest::Input(_, _) => continue,
+            ProxyRequest::Input(..) => continue,
+            ProxyRequest::EpochInput(_, token, done, _) => {
+                token.retire();
+                let _ = done.send(Err(input_emulation::EmulationError::EndOfStream));
+            }
+            ProxyRequest::Barrier(done) => {
+                drop(done);
+            }
             ProxyRequest::Remove(addr) => {
                 handles.remove(&addr);
             }
             ProxyRequest::Forget(addr) => {
                 forget_peer_state(handles, post_processing, addr);
             }
-            ProxyRequest::WarpToEdge(_, _, completion) => {
+            ProxyRequest::WarpToEdge(_, _, _, completion, _) => {
                 let _ = completion.send(None);
             }
             ProxyRequest::RefreshDisplayLayout(completion) => {

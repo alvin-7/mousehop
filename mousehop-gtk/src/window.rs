@@ -325,6 +325,22 @@ impl Window {
                         ),
                     );
                     row.connect_closure(
+                        "request-use-kcp-change",
+                        false,
+                        closure_local!(
+                            #[strong]
+                            window,
+                            move |row: ClientRow, enabled: bool| {
+                                if let Some(client) = window.client_by_idx(row.index() as u32) {
+                                    window.request(FrontendRequest::SetClientUseKcp(
+                                        client.handle(),
+                                        enabled,
+                                    ));
+                                }
+                            }
+                        ),
+                    );
+                    row.connect_closure(
                         "request-require-crossing-modifier-change",
                         false,
                         closure_local!(
@@ -501,6 +517,7 @@ impl Window {
         row.set_position(client.pos);
         row.set_clipboard_send(client.clipboard_send);
         row.set_command_as_ctrl(client.command_as_ctrl);
+        row.set_use_kcp(client.use_kcp);
         row.set_crossing_modifier(client.require_crossing_modifier, client.crossing_modifier);
         if let Some(client_object) = self.client_object_for_handle(handle) {
             client_object.set_mode(client.mode);
@@ -509,6 +526,13 @@ impl Window {
     }
 
     pub(super) fn update_client_state(&self, handle: ClientHandle, state: ClientState) {
+        if let Some(client) = self.client_object_for_handle(handle) {
+            client.set_transport_status(if state.transport_status.is_empty() {
+                "Disconnected"
+            } else {
+                &state.transport_status
+            });
+        }
         let Some(row) = self.row_for_handle(handle) else {
             log::warn!("could not find row for handle {handle}");
             return;

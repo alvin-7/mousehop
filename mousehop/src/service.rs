@@ -223,11 +223,23 @@ impl Service {
         // the dialer side so its references survive Discovery
         // toggles; Discovery writes peer hints into it as browse
         // events arrive.
-        let listener =
-            MousehopListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
+        // Snapshot once: config reload/save preserves the new value for restart,
+        // while all current and future sessions of this process keep this policy.
+        let kcp_timeouts = config.kcp_timeouts();
+        let listener = MousehopListener::new(
+            config.port(),
+            cert.clone(),
+            authorized_keys.clone(),
+            kcp_timeouts,
+        )
+        .await?;
         let primary_cache: PrimaryCache = Default::default();
-        let conn =
-            MousehopConnection::new(cert.clone(), client_manager.clone(), primary_cache.clone());
+        let conn = MousehopConnection::new(
+            cert.clone(),
+            client_manager.clone(),
+            primary_cache.clone(),
+            kcp_timeouts,
+        );
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -474,6 +486,35 @@ impl Service {
                     self.save_config().await;
                 }
             }
+            FrontendRequest::SetClientUseKcp(handle, enabled) => {
+                if self.client_manager.get_state(handle).is_some() {
+                    if self.client_manager.set_use_kcp(handle, enabled) {
+                        let released = self.capture.release_client(handle).await;
+                        self.conn.reset_handle(handle).await;
+                        self.client_manager.set_transport_status(
+                            handle,
+                            if released {
+                                "Disconnected"
+                            } else {
+                                "Failed: input release not confirmed"
+                            },
+                        );
+                        if !released {
+                            self.deactivate_client(handle);
+                        }
+                        if released
+                            && self
+                                .client_manager
+                                .get_state(handle)
+                                .is_some_and(|(_, s)| s.active)
+                        {
+                            let _ = self.conn.send(ProtoEvent::Ping, handle).await;
+                        }
+                    }
+                    self.broadcast_client(handle);
+                    self.save_config().await;
+                }
+            }
             FrontendRequest::SetClientCommandAsCtrl(handle, enabled) => {
                 if self.client_manager.set_command_as_ctrl(handle, enabled) {
                     self.capture.set_command_as_ctrl(handle, enabled);
@@ -704,6 +745,7 @@ impl Service {
                 network_locks: c.network_locks,
                 clipboard_send: c.clipboard_send,
                 command_as_ctrl: c.command_as_ctrl,
+                use_kcp: c.use_kcp,
                 require_crossing_modifier: c.require_crossing_modifier,
                 crossing_modifier: c.crossing_modifier,
             })
@@ -1318,6 +1360,10 @@ impl Service {
 
     fn add_client(&mut self) {
         let handle = self.client_manager.add_client();
+        self.client_manager.set_use_kcp(
+            handle,
+            self.config.input_transport() == crate::transport::InputTransport::KcpRequired,
+        );
         log::info!("added client {handle}");
         let (c, s) = self.client_manager.get_state(handle).unwrap();
         self.notify_frontend(FrontendEvent::Created(handle, c, s));

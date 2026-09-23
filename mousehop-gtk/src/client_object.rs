@@ -49,6 +49,15 @@ impl ClientObject {
             .property("peer-commit", peer_commit_to_string(state.peer_commit))
             .property("clipboard-send", client.clipboard_send)
             .property("command-as-ctrl", client.command_as_ctrl)
+            .property("use-kcp", client.use_kcp)
+            .property(
+                "transport-status",
+                if state.transport_status.is_empty() {
+                    "Disconnected"
+                } else {
+                    &state.transport_status
+                },
+            )
             .property(
                 "require-crossing-modifier",
                 client.require_crossing_modifier,
@@ -282,6 +291,8 @@ pub struct ClientData {
     pub peer_commit: Option<String>,
     pub clipboard_send: bool,
     pub command_as_ctrl: bool,
+    pub use_kcp: bool,
+    pub transport_status: String,
     pub require_crossing_modifier: bool,
     pub crossing_modifier: u32,
     /// Candidate addresses with per-address latency, rendered into the

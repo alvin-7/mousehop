@@ -133,6 +133,19 @@
 		</child>
 		<!-- clipboard send toggle -->
 		<child>
+			<object class="AdwActionRow" id="kcp_row">
+				<property name="title" translatable="yes">Use KCP</property>
+				<property name="subtitle" translatable="yes">Disconnected</property>
+				<property name="tooltip-text" translatable="yes">Reliable input for lossy Wi-Fi. Changing this setting reconnects this peer. The receiver negotiates automatically.</property>
+				<property name="activatable">false</property>
+				<child type="suffix">
+					<object class="GtkSwitch" id="use_kcp_switch">
+						<property name="valign">center</property>
+					</object>
+				</child>
+			</object>
+		</child>
+		<child>
 			<object class="AdwActionRow">
 				<property name="title" translatable="yes">Share Clipboard With This Peer</property>
 				<property name="subtitle" translatable="yes">When you copy text on this device, send it to this peer.</property>
