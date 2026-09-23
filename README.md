@@ -757,6 +757,19 @@ second inertia curve. Windows applications may still render wheel scrolling
 differently from native macOS applications. Existing Mac receiver behavior is
 unchanged.
 
+### Mac trackpad pinch and scroll direction
+
+When a Mac controls a peer that has no native pinch event, Mousehop translates
+pinch-zoom into the widely supported Ctrl+wheel form. The synthetic Ctrl key is
+held only for the gesture and released when it ends. The first zoom notch and a
+mid-gesture reversal require more travel than subsequent notches so finger
+settle cannot first emit the opposite direction.
+
+Continuous trackpad scrolling latches one primary axis per gesture. This keeps
+a horizontal swipe from leaking vertical noise, prevents Shift+scroll from
+feeding both axes, and lets momentum continue the axis already in use. A new
+touch or a sufficiently long gap starts a new latch decision.
+
 ### macOS keyboard injection
 
 The receiving Mac posts forwarded keys as real HID events

@@ -37,6 +37,7 @@ use std::{
     sync::{Arc, OnceLock},
     task::{Context, Poll, ready},
     thread::{self},
+    time::{Duration, Instant},
 };
 use tokio::sync::{
     Mutex,
@@ -198,6 +199,55 @@ struct InputCaptureState {
     /// union as a filled rectangle, which would create dead edges in stepped
     /// multi-monitor layouts.
     display_layout: DisplayLayout,
+    /// Native pinch-zoom gestures are translated into Ctrl+wheel for peers
+    /// that do not share a semantic zoom event model.
+    zoom_gesture: ZoomGestureState,
+    /// Trackpad scroll direction is locked from point deltas, while the wire
+    /// event uses accumulated point deltas in wheel units.
+    scroll_gesture: ScrollGestureState,
+}
+
+#[derive(Debug, Default)]
+struct ZoomGestureState {
+    active: bool,
+    synthetic_ctrl: bool,
+    /// Direction of the last notch emitted in this gesture. Starting a new
+    /// direction costs the larger commit threshold; continuing the current one
+    /// costs only a step.
+    emitted_direction: f64,
+    pending_magnification: f64,
+}
+
+/// Per-gesture scroll state.
+///
+/// Modelled on how AppKit handles predominant-axis scrolling: the axis is
+/// latched once, early in a gesture, and held for that gesture's whole life.
+/// There is deliberately no mid-gesture switching heuristic — changing scroll
+/// direction means lifting the fingers, which starts a new gesture, which
+/// re-latches from scratch. A latch that can outlive its gesture is what made
+/// a direction change appear to hang for seconds.
+#[derive(Debug, Default)]
+struct ScrollGestureState {
+    latched_axis: Option<u8>,
+    accumulated_vertical: f64,
+    accumulated_horizontal: f64,
+    /// Sub-unit wheel remainder, kept per axis so neither axis can consume or
+    /// zero the other's fraction.
+    pending_vertical_units: f64,
+    pending_horizontal_units: f64,
+    /// Momentum keeps the latched axis after finger lift. The next
+    /// non-momentum movement is always treated as a new gesture.
+    ended: bool,
+    /// A rest-to-stop nudge waiting for the next sample to confirm that this
+    /// really is a scroll. Fingers landing for a pinch produce the same
+    /// motionless `MayBegin` as fingers resting to halt a fling; only the
+    /// following sample tells them apart.
+    pending_stop_nudge: bool,
+    /// Last sample time, for the idle-gap gesture boundary. This is a fallback
+    /// for hardware or macOS versions that do not populate the scroll-phase
+    /// field: without it, a missing `Ended` phase would latch the axis for the
+    /// rest of the session.
+    last_sample: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -325,6 +375,8 @@ impl InputCaptureState {
             enter_position: None,
             bounds: Bounds::default(),
             display_layout: DisplayLayout::default(),
+            zoom_gesture: ZoomGestureState::default(),
+            scroll_gesture: ScrollGestureState::default(),
         };
         res.update_bounds()?;
         Ok(res)
@@ -464,6 +516,8 @@ impl InputCaptureState {
                     self.current_pos
                 );
                 if self.current_pos.take().is_some() {
+                    self.zoom_gesture = ZoomGestureState::default();
+                    self.scroll_gesture = ScrollGestureState::default();
                     // We hold the callback's state mutex for this whole
                     // transition, so clearing ownership first prevents any
                     // later callback from swallowing input. Warp while the
@@ -507,6 +561,8 @@ impl InputCaptureState {
                 self.crossing_modifiers.remove(&p);
                 if self.current_pos == Some(p) {
                     self.current_pos = None;
+                    self.zoom_gesture = ZoomGestureState::default();
+                    self.scroll_gesture = ScrollGestureState::default();
                     self.show_cursor()?;
                 }
             }
@@ -526,6 +582,8 @@ impl InputCaptureState {
                 // don't leave the cursor hidden even if the outer
                 // task only logs this error rather than propagating.
                 if let Some(pos) = self.current_pos.take() {
+                    self.zoom_gesture = ZoomGestureState::default();
+                    self.scroll_gesture = ScrollGestureState::default();
                     if let Some(recovery) = self.tap_recovery_pending.as_mut() {
                         recovery.interrupted_pos.get_or_insert(pos);
                     }
@@ -762,9 +820,287 @@ fn modifier_key_states(key: u32, flags: CGEventFlags) -> ([u8; 2], usize) {
     }
 }
 
+const GESTURE_EVENT_TYPE: u32 = 110;
+const GESTURE_EVENT_TYPE_ZOOM: i64 = 8;
+const GESTURE_MAGNIFICATION: u32 = 113;
+const GESTURE_PHASE: u32 = 132;
+const IOHID_EVENT_PHASE_BEGAN: i64 = 1;
+const IOHID_EVENT_PHASE_CHANGED: i64 = 2;
+const IOHID_EVENT_PHASE_ENDED: i64 = 4;
+const IOHID_EVENT_PHASE_CANCELLED: i64 = 8;
+/// Magnification change that maps to one full Windows wheel notch. A pinch
+/// reports magnification as a fraction of the current scale per event, so this
+/// is the gain of the whole gesture: smaller means a shorter pinch to zoom the
+/// same amount. 8% keeps a full-trackpad pinch around six notches, which is
+/// roughly what the same pinch produces natively.
+const ZOOM_GESTURE_STEP: f64 = 0.08;
+/// Net magnification required before the *first* notch of a gesture, and
+/// before one that reverses the direction already being emitted. Two fingers
+/// settling onto the trackpad drift apart slightly before a pinch-in really
+/// starts; at the plain step that drift is enough to fire one notch the wrong
+/// way, which reads as "zooms in before it zooms out". Requiring more travel
+/// to open or to turn around absorbs the settle while still letting a genuine
+/// reversal through.
+const ZOOM_DIRECTION_COMMIT: f64 = 0.16;
+
+fn zoom_ctrl_event(state: u8) -> CaptureEvent {
+    CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+        time: 0,
+        key: scancode::Linux::KeyLeftCtrl as u32,
+        state,
+    }))
+}
+
+fn queue_zoom_wheel(direction: f64, result: &mut Vec<CaptureEvent>) {
+    // Windows applications commonly map Ctrl+wheel-up to zoom in and wheel-down
+    // to zoom out. The real-world IOHID zoom direction is opposite to AppKit's
+    // magnification sign on Apple trackpads, so negate it here. Wire vertical
+    // scrolling is positive down and the Windows backend negates it again.
+    let value = if direction > 0.0 { 120 } else { -120 };
+    result.push(CaptureEvent::Input(Event::Pointer(
+        PointerEvent::AxisDiscrete120 { axis: 0, value },
+    )));
+}
+
+/// Fold one magnification sample into the gesture's running total and emit a
+/// wheel notch for every whole step it crosses.
+///
+/// The accumulator is *signed* and is never reset mid-gesture. That is what
+/// makes the zoom track the fingers: IOHID magnification samples jitter around
+/// zero while the pinch is held steady, and a reversal is a legitimate part of
+/// one continuous gesture. Summing them lets the noise cancel and lets a
+/// reversal walk the total back down, so the emitted notches always reflect the
+/// net distance the fingers travelled. Opening or reversing costs
+/// `ZOOM_DIRECTION_COMMIT` rather than a plain step, so neither the initial
+/// finger settle nor a wobble mid-pinch can emit a notch against the gesture.
+fn accumulate_zoom_magnification(
+    magnification: f64,
+    state: &mut ZoomGestureState,
+    result: &mut Vec<CaptureEvent>,
+) {
+    if !magnification.is_finite() {
+        return;
+    }
+    state.pending_magnification += magnification;
+    loop {
+        let direction = state.pending_magnification.signum();
+        let threshold = if direction == state.emitted_direction {
+            ZOOM_GESTURE_STEP
+        } else {
+            ZOOM_DIRECTION_COMMIT
+        };
+        if state.pending_magnification.abs() < threshold {
+            return;
+        }
+        queue_zoom_wheel(direction, result);
+        // Consume the threshold that was actually paid. Subtracting only a
+        // step after a commit would leave the difference in the accumulator,
+        // firing a second notch in the same breath and making the gesture
+        // jump at the moment it starts or turns around.
+        state.pending_magnification -= direction * threshold;
+        state.emitted_direction = direction;
+    }
+}
+
+const SCROLL_DIRECTION_LOCK_DISTANCE: f64 = 3.0;
+const SCROLL_DIRECTION_DOMINANCE: f64 = 1.15;
+const SCROLL_DIRECTION_FALLBACK_DISTANCE: f64 = 12.0;
+const WHEEL_UNITS_PER_SCROLL_PIXEL: f64 = 3.0;
+
+/// CGScrollPhase values. macOS reports these on continuous (trackpad) scroll
+/// events; they are the gesture boundaries AppKit itself keys off.
+const CG_SCROLL_PHASE_BEGAN: i64 = 1;
+const CG_SCROLL_PHASE_ENDED: i64 = 4;
+const CG_SCROLL_PHASE_CANCELLED: i64 = 8;
+const CG_SCROLL_PHASE_MAY_BEGIN: i64 = 128;
+
+/// Silence that separates two gestures. Trackpad samples arrive roughly every
+/// 8ms while a finger is down and throughout the momentum coast, so any gap
+/// this long means the previous gesture is over. Only used as a backstop when
+/// the phase field does not arrive.
+const SCROLL_GESTURE_IDLE_GAP: Duration = Duration::from_millis(150);
+
+fn scroll_phase_ends_gesture(scroll_phase: i64) -> bool {
+    matches!(
+        scroll_phase,
+        CG_SCROLL_PHASE_ENDED | CG_SCROLL_PHASE_CANCELLED
+    )
+}
+
+/// Latch the gesture's axis. Called once per continuous scroll sample, before
+/// `queue_latched_scroll`.
+fn latch_scroll_axis(
+    vertical: i64,
+    horizontal: i64,
+    scroll_phase: i64,
+    momentum: bool,
+    now: Instant,
+    state: &mut ScrollGestureState,
+) {
+    let idle_gap = state
+        .last_sample
+        .is_some_and(|last| now.saturating_duration_since(last) >= SCROLL_GESTURE_IDLE_GAP);
+    if matches!(
+        scroll_phase,
+        CG_SCROLL_PHASE_BEGAN | CG_SCROLL_PHASE_MAY_BEGIN
+    ) || idle_gap
+        || (!momentum && state.ended && (vertical != 0 || horizontal != 0))
+    {
+        *state = ScrollGestureState::default();
+    }
+    state.last_sample = Some(now);
+
+    if scroll_phase_ends_gesture(scroll_phase) {
+        state.ended = true;
+        return;
+    }
+    // Momentum is the OS coasting the gesture that just ended. It must not
+    // influence the latch, but it keeps feeding the axis already latched.
+    if momentum || state.latched_axis.is_some() {
+        return;
+    }
+
+    state.accumulated_vertical += vertical as f64;
+    state.accumulated_horizontal += horizontal as f64;
+    let total_vertical = state.accumulated_vertical.abs();
+    let total_horizontal = state.accumulated_horizontal.abs();
+    if total_vertical.max(total_horizontal) < SCROLL_DIRECTION_LOCK_DISTANCE {
+        return;
+    }
+    if total_vertical >= total_horizontal * SCROLL_DIRECTION_DOMINANCE {
+        state.latched_axis = Some(0);
+    } else if total_horizontal >= total_vertical * SCROLL_DIRECTION_DOMINANCE {
+        state.latched_axis = Some(1);
+    } else if total_vertical.max(total_horizontal) >= SCROLL_DIRECTION_FALLBACK_DISTANCE {
+        // Ambiguous but well past the threshold — commit to the larger axis
+        // rather than leaving the gesture unlatched and silent.
+        state.latched_axis = Some(u8::from(total_horizontal > total_vertical));
+    }
+}
+
+/// Consume a deferred rest-to-stop nudge. It fires unless this sample ends the
+/// gesture — a `Cancelled` means macOS reclassified the touch as a pinch, so
+/// the nudge was never a scroll and is dropped.
+fn take_stop_nudge(scroll_phase: i64, state: &mut ScrollGestureState) -> bool {
+    std::mem::take(&mut state.pending_stop_nudge) && !scroll_phase_ends_gesture(scroll_phase)
+}
+
+/// Arm the nudge when fingers land without moving. Must run after
+/// `latch_scroll_axis`, whose gesture reset clears the flag.
+fn arm_stop_nudge(
+    vertical: i64,
+    horizontal: i64,
+    scroll_phase: i64,
+    momentum: bool,
+    state: &mut ScrollGestureState,
+) {
+    if !momentum
+        && vertical == 0
+        && horizontal == 0
+        && matches!(
+            scroll_phase,
+            CG_SCROLL_PHASE_BEGAN | CG_SCROLL_PHASE_MAY_BEGIN
+        )
+    {
+        state.pending_stop_nudge = true;
+    }
+}
+
+fn queue_latched_scroll(
+    point_vertical: i64,
+    point_horizontal: i64,
+    state: &mut ScrollGestureState,
+    result: &mut Vec<CaptureEvent>,
+) {
+    let (axis, delta, pending) = match state.latched_axis {
+        Some(0) => (0, point_vertical, &mut state.pending_vertical_units),
+        Some(1) => (1, point_horizontal, &mut state.pending_horizontal_units),
+        _ => return,
+    };
+    *pending += delta as f64 * WHEEL_UNITS_PER_SCROLL_PIXEL;
+    // Emit whole units and carry the fraction, so slow finger movement
+    // accumulates into motion instead of being truncated away sample by sample.
+    let units = pending.trunc();
+    if units != 0.0 {
+        *pending -= units;
+        enqueue_scroll_units(axis, units as i32, result);
+    }
+}
+
+fn enqueue_scroll_units(axis: u8, value: i32, result: &mut Vec<CaptureEvent>) {
+    if value != 0 {
+        result.push(CaptureEvent::Input(Event::Pointer(
+            PointerEvent::AxisDiscrete120 { axis, value },
+        )));
+    }
+}
+
+fn append_zoom_gesture_sample(
+    gesture_type: i64,
+    magnification: f64,
+    phase: i64,
+    control_held: bool,
+    state: &mut ZoomGestureState,
+    result: &mut Vec<CaptureEvent>,
+) {
+    if gesture_type != GESTURE_EVENT_TYPE_ZOOM {
+        return;
+    }
+
+    match phase {
+        IOHID_EVENT_PHASE_BEGAN | IOHID_EVENT_PHASE_CHANGED => {
+            let beginning = !state.active;
+            if beginning {
+                state.active = true;
+                state.pending_magnification = 0.0;
+                state.emitted_direction = 0.0;
+                state.synthetic_ctrl = !control_held;
+                if state.synthetic_ctrl {
+                    result.push(zoom_ctrl_event(1));
+                }
+            }
+            accumulate_zoom_magnification(magnification, state, result);
+        }
+        IOHID_EVENT_PHASE_ENDED if state.active => {
+            accumulate_zoom_magnification(magnification, state, result);
+        }
+        IOHID_EVENT_PHASE_CANCELLED => {
+            state.pending_magnification = 0.0;
+        }
+        _ => {}
+    }
+
+    if phase == IOHID_EVENT_PHASE_ENDED || phase == IOHID_EVENT_PHASE_CANCELLED {
+        if state.synthetic_ctrl {
+            result.push(zoom_ctrl_event(0));
+        }
+        *state = ZoomGestureState::default();
+    }
+}
+
+fn append_zoom_gesture(
+    event: &CGEvent,
+    flags: CGEventFlags,
+    state: &mut ZoomGestureState,
+    result: &mut Vec<CaptureEvent>,
+) {
+    let gesture_type = event.get_integer_value_field(GESTURE_EVENT_TYPE);
+    let magnification = event.get_double_value_field(GESTURE_MAGNIFICATION);
+    let phase = event.get_integer_value_field(GESTURE_PHASE);
+    append_zoom_gesture_sample(
+        gesture_type,
+        magnification,
+        phase,
+        flags.contains(CGEventFlags::CGEventFlagControl),
+        state,
+        result,
+    );
+}
+
 fn get_events(
     ev_type: &CGEventType,
     ev: &CGEvent,
+    scroll_state: &mut ScrollGestureState,
     result: &mut Vec<CaptureEvent>,
 ) -> Result<(), CaptureError> {
     fn map_pointer_event(ev: &CGEvent) -> PointerEvent {
@@ -943,18 +1279,12 @@ fn get_events(
                 // would otherwise pin the sink's gap-inference kinetic scroll).
                 const SCROLL_WHEEL_EVENT_MOMENTUM_PHASE: u32 = 123;
                 let momentum = ev.get_integer_value_field(SCROLL_WHEEL_EVENT_MOMENTUM_PHASE) != 0;
-                let v = sign
+                const SCROLL_WHEEL_EVENT_SCROLL_PHASE: u32 = 99;
+                let scroll_phase = ev.get_integer_value_field(SCROLL_WHEEL_EVENT_SCROLL_PHASE);
+                let point_v = sign
                     * ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
-                let h = sign
+                let point_h = sign
                     * ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2);
-                if v != 0 {
-                    result.push(CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
-                        time: 0,
-                        axis: 0, // Vertical
-                        value: v as f64,
-                        momentum,
-                    })));
-                }
                 // Rest-to-stop over the link. A cohort app stops its kinetic
                 // coast when fingers rest on the trackpad; locally that's the
                 // Wayland hold gesture, but no virtual-input backend can inject
@@ -962,26 +1292,36 @@ fn get_events(
                 // finger touch-down as a CGScrollPhase Began(1)/MayBegin(128)
                 // event with no movement (and no momentum). Forward a 1px nudge
                 // on it so the sink cohort app's raw-delta re-touch path halts
-                // the fling. These are edge events (one per touch-down), so a
-                // motionless rest doesn't creep; a real scroll absorbs the 1px.
-                const SCROLL_WHEEL_EVENT_SCROLL_PHASE: u32 = 99;
-                let scroll_phase = ev.get_integer_value_field(SCROLL_WHEEL_EVENT_SCROLL_PHASE);
-                if !momentum && v == 0 && h == 0 && matches!(scroll_phase, 1 | 128) {
+                // the fling.
+                //
+                // The nudge is held for one sample rather than sent at once.
+                // Two fingers landing for a pinch produce exactly the same
+                // motionless MayBegin — macOS does not yet know which gesture
+                // it is either, which is why it opens a scroll gesture and then
+                // Cancels it once the pinch is recognised. Sending immediately
+                // injected a stray scroll at the start of every pinch; waiting
+                // for the next sample lets a Cancel discard it. A real scroll
+                // sends it one sample (~8ms) later, and absorbs the 1px.
+                let deferred_nudge = take_stop_nudge(scroll_phase, scroll_state);
+                latch_scroll_axis(
+                    point_v,
+                    point_h,
+                    scroll_phase,
+                    momentum,
+                    Instant::now(),
+                    scroll_state,
+                );
+                if deferred_nudge {
+                    let axis = scroll_state.latched_axis.unwrap_or(0);
                     result.push(CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
                         time: 0,
-                        axis: 0, // Vertical — trips the sink's re-touch stop.
+                        axis, // Trips the sink's re-touch stop on this gesture.
                         value: 1.0,
                         momentum: false,
                     })));
                 }
-                if h != 0 {
-                    result.push(CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
-                        time: 0,
-                        axis: 1, // Horizontal
-                        value: h as f64,
-                        momentum,
-                    })));
-                }
+                queue_latched_scroll(point_v, point_h, scroll_state, result);
+                arm_stop_nudge(point_v, point_h, scroll_phase, momentum, scroll_state);
             } else {
                 // line based scrolling
                 //
@@ -1048,6 +1388,7 @@ fn create_event_tap<'a>(
         CGEventType::LeftMouseDragged,
         CGEventType::RightMouseDragged,
         CGEventType::OtherMouseDragged,
+        CGEventType::Gesture,
         CGEventType::ScrollWheel,
         CGEventType::KeyDown,
         CGEventType::KeyUp,
@@ -1129,7 +1470,19 @@ fn create_event_tap<'a>(
         // Are we in a client?
         if let Some(current_pos) = state.current_pos {
             capture_position = Some(current_pos);
-            get_events(&event_type, cg_ev, &mut res_events).unwrap_or_else(|e| {
+            append_zoom_gesture(
+                cg_ev,
+                cg_ev.get_flags(),
+                &mut state.zoom_gesture,
+                &mut res_events,
+            );
+            get_events(
+                &event_type,
+                cg_ev,
+                &mut state.scroll_gesture,
+                &mut res_events,
+            )
+            .unwrap_or_else(|e| {
                 log::error!("Failed to get events: {e}");
             });
 
@@ -1816,6 +2169,303 @@ mod permission_tests {
 mod event_tap_tests {
     use super::*;
 
+    fn zoom_wheel_value(event: &CaptureEvent) -> Option<i32> {
+        match event {
+            CaptureEvent::Input(Event::Pointer(PointerEvent::AxisDiscrete120 {
+                axis: 0,
+                value,
+            })) => Some(*value),
+            _ => None,
+        }
+    }
+
+    fn wheel_axis_value(event: &CaptureEvent) -> Option<(u8, i32)> {
+        match event {
+            CaptureEvent::Input(Event::Pointer(PointerEvent::AxisDiscrete120 { axis, value })) => {
+                Some((*axis, *value))
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn pinch_out_and_pinch_in_preserve_opposite_windows_zoom_directions() {
+        let mut out = ZoomGestureState::default();
+        let mut events = Vec::new();
+        append_zoom_gesture_sample(8, 0.0, 1, false, &mut out, &mut events);
+        append_zoom_gesture_sample(8, 0.161, 2, false, &mut out, &mut events);
+        append_zoom_gesture_sample(8, 0.0, 4, false, &mut out, &mut events);
+        assert_eq!(zoom_wheel_value(&events[1]), Some(120));
+        assert_eq!(events.len(), 3);
+
+        let mut input = ZoomGestureState::default();
+        let mut events = Vec::new();
+        append_zoom_gesture_sample(8, 0.0, 1, false, &mut input, &mut events);
+        append_zoom_gesture_sample(8, -0.161, 2, false, &mut input, &mut events);
+        append_zoom_gesture_sample(8, 0.0, 4, false, &mut input, &mut events);
+        assert_eq!(zoom_wheel_value(&events[1]), Some(-120));
+        assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn zoom_gesture_reuses_physical_control_and_accumulates_small_deltas() {
+        let mut state = ZoomGestureState::default();
+        let mut events = Vec::new();
+        append_zoom_gesture_sample(8, 0.0, 1, true, &mut state, &mut events);
+        append_zoom_gesture_sample(8, 0.081, 2, true, &mut state, &mut events);
+        assert!(events.is_empty());
+        append_zoom_gesture_sample(8, 0.081, 2, true, &mut state, &mut events);
+        assert_eq!(events.len(), 1);
+        append_zoom_gesture_sample(8, 0.0, 4, true, &mut state, &mut events);
+        assert_eq!(events.len(), 1);
+    }
+
+    /// A pinch that jitters around zero before the fingers commit must not
+    /// spend those samples: they cancel, and the notch is emitted only once the
+    /// net travel crosses the commit threshold.
+    #[test]
+    fn zoom_jitter_cancels_instead_of_emitting_wheel_notches() {
+        let mut state = ZoomGestureState::default();
+        let mut events = Vec::new();
+        append_zoom_gesture_sample(8, 0.0, 1, false, &mut state, &mut events);
+        for sample in [0.03, -0.03, 0.03, -0.03] {
+            append_zoom_gesture_sample(8, sample, 2, false, &mut state, &mut events);
+        }
+        assert_eq!(events.len(), 1, "only the synthetic ctrl press");
+        append_zoom_gesture_sample(8, 0.161, 2, false, &mut state, &mut events);
+        assert_eq!(zoom_wheel_value(&events[1]), Some(120));
+        append_zoom_gesture_sample(8, 0.0, 4, false, &mut state, &mut events);
+        assert_eq!(events.len(), 3);
+    }
+
+    /// Fingers settling onto the trackpad drift outward before a pinch-in
+    /// really starts. That drift must not emit a zoom-in notch, or the gesture
+    /// visibly zooms the wrong way before going the right way.
+    #[test]
+    fn zoom_out_does_not_emit_a_zoom_in_notch_while_fingers_settle() {
+        let mut state = ZoomGestureState::default();
+        let mut events = Vec::new();
+        append_zoom_gesture_sample(8, 0.0, 1, false, &mut state, &mut events);
+        // Settle: outward drift past a plain step, short of the commit bar.
+        append_zoom_gesture_sample(8, 0.09, 2, false, &mut state, &mut events);
+        assert_eq!(events.len(), 1, "settle must not emit a notch");
+        // The real pinch-in follows and wins.
+        for _ in 0..4 {
+            append_zoom_gesture_sample(8, -0.09, 2, false, &mut state, &mut events);
+        }
+        append_zoom_gesture_sample(8, 0.0, 4, false, &mut state, &mut events);
+        let notches: Vec<_> = events.iter().filter_map(zoom_wheel_value).collect();
+        assert!(!notches.is_empty(), "the pinch-in must still zoom");
+        assert!(
+            notches.iter().all(|&v| v == -120),
+            "every notch must zoom out, got {notches:?}"
+        );
+    }
+
+    /// Reversing direction mid-pinch keeps tracking the fingers: the running
+    /// total walks back down and, once past the commit bar, the next notch
+    /// follows the new direction.
+    #[test]
+    fn zoom_reversal_mid_gesture_emits_the_new_direction() {
+        let mut state = ZoomGestureState::default();
+        let mut events = Vec::new();
+        append_zoom_gesture_sample(8, 0.0, 1, false, &mut state, &mut events);
+        append_zoom_gesture_sample(8, 0.161, 2, false, &mut state, &mut events);
+        assert_eq!(zoom_wheel_value(&events[1]), Some(120));
+        append_zoom_gesture_sample(8, -0.20, 2, false, &mut state, &mut events);
+        assert_eq!(zoom_wheel_value(&events[2]), Some(-120));
+        append_zoom_gesture_sample(8, 0.0, 4, false, &mut state, &mut events);
+        assert_eq!(events.len(), 4);
+    }
+
+    /// Trackpad samples arrive ~8ms apart; helper for building a gesture's
+    /// timeline without real sleeping.
+    fn at(base: Instant, millis: u64) -> Instant {
+        base + Duration::from_millis(millis)
+    }
+
+    #[test]
+    fn horizontal_scroll_latches_and_uses_windows_wheel_units() {
+        let t = Instant::now();
+        let mut state = ScrollGestureState::default();
+        let mut events = Vec::new();
+        latch_scroll_axis(0, -1, 128, false, at(t, 0), &mut state);
+        latch_scroll_axis(0, -4, 2, false, at(t, 8), &mut state);
+        queue_latched_scroll(0, -4, &mut state, &mut events);
+        assert_eq!(wheel_axis_value(&events[0]), Some((1, -12)));
+        queue_latched_scroll(1, -1, &mut state, &mut events);
+        assert_eq!(wheel_axis_value(&events[1]), Some((1, -3)));
+    }
+
+    #[test]
+    fn vertical_scroll_latch_suppresses_shift_horizontal_leak() {
+        let t = Instant::now();
+        let mut state = ScrollGestureState::default();
+        latch_scroll_axis(10, 9, 2, false, at(t, 0), &mut state);
+        latch_scroll_axis(3, 2, 2, false, at(t, 8), &mut state);
+        assert_eq!(state.latched_axis, Some(0));
+        let mut events = Vec::new();
+        queue_latched_scroll(1, 1, &mut state, &mut events);
+        assert_eq!(wheel_axis_value(&events[0]), Some((0, 3)));
+        assert_eq!(events.len(), 1);
+    }
+
+    /// The axis is latched for the gesture's whole life. Cross-axis motion,
+    /// however sustained, never switches it — that is what AppKit does, and it
+    /// is what keeps a direction change from ever appearing to hang.
+    #[test]
+    fn latched_axis_never_switches_mid_gesture() {
+        let t = Instant::now();
+        let mut state = ScrollGestureState::default();
+        latch_scroll_axis(20, 0, 2, false, at(t, 0), &mut state);
+        assert_eq!(state.latched_axis, Some(0));
+        for sample in 1..100 {
+            latch_scroll_axis(0, 20, 2, false, at(t, sample * 8), &mut state);
+        }
+        assert_eq!(
+            state.latched_axis,
+            Some(0),
+            "cross-axis motion must not steal a latched gesture"
+        );
+    }
+
+    /// Lifting the fingers ends the gesture, so the next one re-latches from
+    /// scratch — immediately, with no carry-over from what came before.
+    #[test]
+    fn next_gesture_relatches_on_the_new_direction() {
+        let t = Instant::now();
+        let mut state = ScrollGestureState::default();
+        latch_scroll_axis(20, 0, 2, false, at(t, 0), &mut state);
+        assert_eq!(state.latched_axis, Some(0));
+        latch_scroll_axis(0, 0, CG_SCROLL_PHASE_ENDED, false, at(t, 8), &mut state);
+        // New touch-down, moving the other way.
+        latch_scroll_axis(0, 20, CG_SCROLL_PHASE_BEGAN, false, at(t, 16), &mut state);
+        assert_eq!(state.latched_axis, Some(1), "one sample is enough");
+    }
+
+    /// Backstop for hardware that never reports a phase: a gap in the sample
+    /// stream ends the gesture. Without this the axis would stay latched for
+    /// the rest of the session, which is exactly the multi-second hang.
+    #[test]
+    fn idle_gap_ends_the_gesture_when_no_phase_is_reported() {
+        let t = Instant::now();
+        let mut state = ScrollGestureState::default();
+        latch_scroll_axis(20, 0, 0, false, at(t, 0), &mut state);
+        assert_eq!(state.latched_axis, Some(0));
+        // Still within the gap: same gesture, latch holds.
+        latch_scroll_axis(0, 20, 0, false, at(t, 100), &mut state);
+        assert_eq!(state.latched_axis, Some(0));
+        // Past the gap: a new gesture, latched on its own direction.
+        latch_scroll_axis(0, 20, 0, false, at(t, 400), &mut state);
+        assert_eq!(state.latched_axis, Some(1));
+    }
+
+    /// Momentum is the coast of the gesture that just ended: it keeps feeding
+    /// the axis already latched and must not re-latch or extend the gesture.
+    #[test]
+    fn momentum_feeds_the_latched_axis_without_changing_it() {
+        let t = Instant::now();
+        let mut state = ScrollGestureState::default();
+        latch_scroll_axis(0, 20, 2, false, at(t, 0), &mut state);
+        assert_eq!(state.latched_axis, Some(1));
+        latch_scroll_axis(0, 0, CG_SCROLL_PHASE_ENDED, false, at(t, 8), &mut state);
+        assert!(state.ended);
+
+        // Coast: cross-axis momentum must not steal the latch.
+        latch_scroll_axis(20, 0, 0, true, at(t, 16), &mut state);
+        assert_eq!(state.latched_axis, Some(1));
+        assert!(state.ended);
+        let mut events = Vec::new();
+        queue_latched_scroll(0, 5, &mut state, &mut events);
+        assert_eq!(
+            wheel_axis_value(&events[0]),
+            Some((1, 15)),
+            "momentum still scrolls, on the latched axis"
+        );
+
+        // A real finger movement after the coast starts a new gesture.
+        latch_scroll_axis(12, 0, 0, false, at(t, 24), &mut state);
+        assert!(!state.ended);
+        assert_eq!(state.latched_axis, Some(0));
+    }
+
+    /// Two fingers landing for a pinch look exactly like fingers resting to
+    /// stop a fling: a motionless MayBegin. macOS resolves it by Cancelling the
+    /// scroll gesture it speculatively opened, so the nudge must wait for that
+    /// verdict. Sending it at once injected a stray scroll into the peer at the
+    /// start of every pinch.
+    #[test]
+    fn pinch_start_does_not_emit_a_rest_to_stop_nudge() {
+        let t = Instant::now();
+        let mut state = ScrollGestureState::default();
+
+        // Fingers land — speculative scroll gesture opens.
+        assert!(!take_stop_nudge(CG_SCROLL_PHASE_MAY_BEGIN, &mut state));
+        latch_scroll_axis(0, 0, CG_SCROLL_PHASE_MAY_BEGIN, false, at(t, 0), &mut state);
+        arm_stop_nudge(0, 0, CG_SCROLL_PHASE_MAY_BEGIN, false, &mut state);
+        assert!(state.pending_stop_nudge, "nudge is armed, not yet sent");
+
+        // macOS decides it is a pinch and cancels the scroll.
+        assert!(
+            !take_stop_nudge(CG_SCROLL_PHASE_CANCELLED, &mut state),
+            "a cancelled gesture must discard the nudge"
+        );
+        latch_scroll_axis(0, 0, CG_SCROLL_PHASE_CANCELLED, false, at(t, 8), &mut state);
+        arm_stop_nudge(0, 0, CG_SCROLL_PHASE_CANCELLED, false, &mut state);
+        assert!(!state.pending_stop_nudge);
+    }
+
+    /// The same landing followed by real scrolling still halts the peer's
+    /// fling, one sample later.
+    #[test]
+    fn resting_fingers_still_nudge_when_the_gesture_is_a_scroll() {
+        let t = Instant::now();
+        let mut state = ScrollGestureState::default();
+        take_stop_nudge(CG_SCROLL_PHASE_MAY_BEGIN, &mut state);
+        latch_scroll_axis(0, 0, CG_SCROLL_PHASE_MAY_BEGIN, false, at(t, 0), &mut state);
+        arm_stop_nudge(0, 0, CG_SCROLL_PHASE_MAY_BEGIN, false, &mut state);
+
+        // The finger moves: this is a scroll after all.
+        assert!(
+            take_stop_nudge(2, &mut state),
+            "a continuing gesture must send the deferred nudge"
+        );
+        latch_scroll_axis(9, 0, 2, false, at(t, 8), &mut state);
+        assert_eq!(state.latched_axis, Some(0));
+    }
+
+    /// Each axis carries its own sub-unit remainder. With the current integral
+    /// units-per-pixel ratio no remainder arises in practice, so drive the
+    /// accumulator directly: the invariant must hold if that ratio is ever
+    /// lowered for finer granularity.
+    #[test]
+    fn wheel_remainder_is_carried_per_axis() {
+        let mut state = ScrollGestureState {
+            latched_axis: Some(0),
+            pending_vertical_units: 0.5,
+            pending_horizontal_units: 0.25,
+            ..ScrollGestureState::default()
+        };
+        let mut events = Vec::new();
+        queue_latched_scroll(1, 0, &mut state, &mut events);
+        assert_eq!(wheel_axis_value(&events[0]), Some((0, 3)));
+        assert!((state.pending_vertical_units - 0.5).abs() < f64::EPSILON);
+        assert!(
+            (state.pending_horizontal_units - 0.25).abs() < f64::EPSILON,
+            "the idle axis' fraction must be untouched"
+        );
+    }
+
+    #[test]
+    fn cancelled_zoom_gesture_releases_control_without_emitting_wheel() {
+        let mut state = ZoomGestureState::default();
+        let mut events = Vec::new();
+        append_zoom_gesture_sample(8, 0.0, 1, false, &mut state, &mut events);
+        append_zoom_gesture_sample(8, 0.02, 8, false, &mut state, &mut events);
+        assert_eq!(events.len(), 2);
+        assert!(zoom_wheel_value(&events[1]).is_none());
+    }
+
     #[test]
     fn disabled_tap_transition_clears_capture_and_reports_it_exactly_once() {
         let mut current_pos = Some(Position::Bottom);
@@ -2215,6 +2865,8 @@ mod modifier_tests {
             }),
             bounds: layout_bounds(&old_layout).expect("old bounds"),
             display_layout: old_layout,
+            zoom_gesture: ZoomGestureState::default(),
+            scroll_gesture: ScrollGestureState::default(),
         };
 
         // The old display was replaced by a smaller display shifted right.
