@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/webrtc-util"]
 members = [
     "input-capture",
     "input-emulation",
@@ -28,3 +29,6 @@ codegen-units = 1
 lto = "fat"
 strip = true
 panic = "abort"
+
+[patch.crates-io]
+webrtc-util = { path = "vendor/webrtc-util" }
