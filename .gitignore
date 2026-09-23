@@ -14,3 +14,15 @@ extfile.conf
 # flatpak files
 .flatpak-builder
 repo
+
+# Local KCP investigation reports and generated packages
+/dist/
+/.drafts/
+
+# Development-only probes and local test packaging helpers
+/mousehop/examples/latency_probe.rs
+/packaging/kcp-test.iss
+/scripts/kcp-check.ps1
+/scripts/kcp-package-macos.sh
+/scripts/kcp-package-windows.ps1
+/scripts/kcp-source-manifest.py

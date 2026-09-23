@@ -781,3 +781,22 @@ macOS 11; it is isolated in one small C bridge
 
 When a Mac controls Windows, Command maps to Win by default. Enabling
 **Use Command as Control** for that peer maps Command to Ctrl instead.
+
+### Windows installer
+
+The Windows executable and installer embed the Mousehop icon. To build the
+per-user x64 installer, run from the repository root with the Rust toolchain,
+Windows SDK, GTK runtime/development bundle and Inno Setup available:
+
+```powershell
+./scripts/package-windows.ps1 -GtkRoot <gtk-directory> -InnoCompiler <ISCC.exe> `
+  -VCRuntimeRoot <vc-runtime-directory> -RuntimeLicenseDir <runtime-licenses>
+```
+
+The script produces `dist/windows-<version>-<timestamp>/Mousehop-<version>-x64-Setup.exe`.
+It packages runtime dependencies and licenses, without local diagnostic scripts.
+The installer displays **Mousehop**, creates a Start menu shortcut and offers a
+desktop shortcut. Its installer identity is `com.mousehop.Mousehop`, matching
+the upstream application identifier, and its default directory is
+`%LOCALAPPDATA%\Programs\Mousehop`.
+Regenerate the Windows icon from the shared artwork with `scripts/makeico.ps1`.
