@@ -2366,6 +2366,7 @@ dependencies = [
  "ashpd",
  "async-trait",
  "bitflags 2.11.0",
+ "cc",
  "core-foundation 0.10.1",
  "core-foundation-sys",
  "core-graphics",

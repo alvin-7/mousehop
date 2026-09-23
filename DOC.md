@@ -23,6 +23,49 @@ graph TD
 The input component is responsible for translating inputs from a given backend
 to a standardized format and passing them to the event emitter.
 
+#### macOS receiver keyboard injection
+
+On macOS the receiving side posts forwarded keyboard input as HID-level events:
+modifier transitions go out as `NX_FLAGSCHANGED` through `IOHIDPostEvent` with
+the physical key code of the side that changed plus the matching general and
+device-dependent flag bits, and ordinary keys as `NX_KEYDOWN`/`NX_KEYUP` with no
+global flags. This supports Control+Left/Right Arrow desktop switching, which
+did not work with the previous `CGEvent` injection path in our Mac tests.
+
+`input-emulation/src/macos_keyboard.rs` holds the platform-independent half: the
+side/flag model, side aggregation, default-side materialisation for snapshots
+that name no side, release planning and the fallback policy. It is compiled for
+test targets on every platform. `input-emulation/src/nx_key_bridge.c` contains
+the only SDK `NXEventData` construction and the only `IOHIDPostEvent` call,
+to isolate the macOS SDK types and the API deprecated since macOS 11.
+
+`IOHIDPostEvent` replaces the whole global modifier state, so the backend merges
+the remote snapshot with observed session flags. These flags include synthetic
+input, so simultaneous local and remote presses of the same modifier side
+cannot be distinguished reliably. If the IOHID path
+is unavailable or fails, the backend records the error, releases the input it
+already injected (retrying once through `CGEvent`), and only then continues on
+the `CGEvent` fallback, which types text but does not guarantee macOS system
+shortcuts. A release that fails on both paths is propagated as an emulation
+error: the emulation session stops instead of silently holding the key, and
+its shutdown cleanup retries the release.
+
+##### macOS keyboard diagnostics
+
+Detailed keyboard logs are disabled by default. To troubleshoot the receiving
+Mac, quit Mousehop first and launch its executable with:
+
+```sh
+MOUSEHOP_LOG_LEVEL='mousehop::keyboard=debug,info' \
+  /Applications/Mousehop.app/Contents/MacOS/mousehop > keyboard.log 2>&1
+```
+
+Logs report permission checks, injection path, modifier transitions, arrow
+events, failures and cleanup. `submitted` means the OS API accepted an event,
+not that a shortcut ran. Ordinary character keycodes and text are omitted.
+Warnings remain in the normal connection logs; debug output requires explicit
+redirection as above. No separate diagnostic application is required.
+
 ### Emitter
 The event emitter serializes events and sends them over the network
 to the correct client.

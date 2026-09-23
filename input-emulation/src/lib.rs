@@ -31,6 +31,15 @@ mod libei;
 #[cfg(target_os = "macos")]
 mod macos;
 
+/// Keyboard-injection planning for the macOS backend.
+///
+/// The state machine is platform independent, so it is also compiled for test
+/// targets on every other platform: the flags, side aggregation and failure
+/// policy are verified by `cargo test` everywhere, not only on a Mac.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(test, allow(dead_code))]
+mod macos_keyboard;
+
 pub mod clipboard;
 /// fallback input emulation (logs events)
 mod dummy;
