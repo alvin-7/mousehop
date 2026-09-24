@@ -7,6 +7,7 @@ use std::{
 use input_event::{
     ClipboardEvent, Event, KeyboardEvent, PointerEvent,
     display::{DisplayEdge, DisplayLayout},
+    scancode::Linux,
 };
 
 use crate::clipboard::ClipboardEmulation;
@@ -164,6 +165,12 @@ pub struct InputEmulation {
     /// headless CI, Wayland session without compositor support).
     clipboard: Option<ClipboardEmulation>,
 }
+
+const MOD1_MASK: u32 = 1 << 3;
+const CONTROL_MASK: u32 = 1 << 2;
+const SHIFT_MASK: u32 = 1 << 0;
+const MOD4_MASK: u32 = 1 << 6;
+const MOD5_MASK: u32 = 1 << 7;
 
 impl InputEmulation {
     async fn with_backend(backend: Backend) -> Result<InputEmulation, EmulationCreationError> {
@@ -335,6 +342,18 @@ impl InputEmulation {
                 }
                 Ok(())
             }
+            Event::Keyboard(KeyboardEvent::Modifiers { depressed, .. }) => {
+                if !self.handles.contains(&handle) {
+                    return Ok(());
+                }
+                let previous = self.pressed_keys.get(&handle).cloned().unwrap_or_default();
+                self.track_snapshot_modifiers(handle, depressed);
+                if let Err(error) = self.emulation.consume(event, handle).await {
+                    self.pressed_keys.insert(handle, previous);
+                    return Err(error);
+                }
+                Ok(())
+            }
             _ => self.emulation.consume(event, handle).await,
         }
     }
@@ -427,6 +446,18 @@ impl InputEmulation {
 
     pub async fn release_keys(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
         let mut failure = None;
+        // Reset the aggregate state in one backend transition before key-ups.
+        // macOS reads combined flags on each transition; individual modifier
+        // releases can otherwise reclassify a just-released remote flag as local.
+        let event = Event::Keyboard(KeyboardEvent::Modifiers {
+            depressed: 0,
+            latched: 0,
+            locked: 0,
+            group: 0,
+        });
+        if let Err(error) = self.emulation.consume(event, handle).await {
+            failure = Some(error);
+        }
         if let Some(keys) = self.pressed_keys.get_mut(&handle) {
             for key in keys.iter().copied().collect::<Vec<_>>() {
                 let event = Event::Keyboard(KeyboardEvent::Key {
@@ -461,15 +492,6 @@ impl InputEmulation {
             }
         }
 
-        let event = Event::Keyboard(KeyboardEvent::Modifiers {
-            depressed: 0,
-            latched: 0,
-            locked: 0,
-            group: 0,
-        });
-        if let Err(error) = self.emulation.consume(event, handle).await {
-            failure = Some(error);
-        }
         failure.map_or(Ok(()), Err)
     }
 
@@ -514,6 +536,41 @@ impl InputEmulation {
         } else {
             // currently not pressed => can press
             pressed_keys.insert(key)
+        }
+    }
+
+    /// Keep aggregate modifier snapshots removable as concrete key-ups.
+    ///
+    /// A controller can establish modifiers with a side-agnostic snapshot when
+    /// they were already held while crossing screens. Record concrete sides so
+    /// `release_keys` can send key-ups after the aggregate reset as a fallback.
+    /// Remove tracked sides when an authoritative snapshot clears their kind.
+    fn track_snapshot_modifiers(&mut self, handle: EmulationHandle, depressed: u32) {
+        let Some(pressed_keys) = self.pressed_keys.get_mut(&handle) else {
+            return;
+        };
+        for (mask, sides) in [
+            (SHIFT_MASK, [Linux::KeyLeftShift, Linux::KeyRightShift]),
+            (CONTROL_MASK, [Linux::KeyLeftCtrl, Linux::KeyRightCtrl]),
+            (
+                MOD1_MASK | MOD5_MASK,
+                [Linux::KeyLeftAlt, Linux::KeyRightalt],
+            ),
+            (MOD4_MASK, [Linux::KeyLeftMeta, Linux::KeyRightmeta]),
+        ] {
+            if depressed & mask == 0 {
+                for side in sides {
+                    pressed_keys.remove(&(side as u32));
+                }
+                continue;
+            }
+            if sides
+                .iter()
+                .any(|side| pressed_keys.contains(&(*side as u32)))
+            {
+                continue;
+            }
+            pressed_keys.insert(sides[0] as u32);
         }
     }
 }

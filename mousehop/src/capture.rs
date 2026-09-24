@@ -2201,8 +2201,12 @@ impl CaptureTask {
         if let Some(handle) = self.active_client.take() {
             let session = self.active_session.take();
             let handover_serial = self.active_handover_serial.take();
+            // Reset the aggregate modifier state before sending individual
+            // key-ups. macOS reads combined flags on each transition, so
+            // releasing a chord one key at a time can preserve an earlier
+            // remote modifier as if it were locally held.
             // Synthesize key-up events for every logical key still held
-            // BEFORE sending Leave. Without
+            // before sending Leave. Without
             // this, pressing the release-bind chord (typically all four
             // modifiers) leaves the peer with phantom held modifiers:
             // the down events were forwarded while capture was active,
@@ -2215,8 +2219,6 @@ impl CaptureTask {
             // already contain a matching up that failed to send, or may hold
             // raw Command while the peer received an aliased Control.
             if let Some(session) = session {
-                self.release_peer_keys(handle, session, handover_serial)
-                    .await;
                 // Reset the modifier mask too. The peer's input-emulation
                 // layer keeps a separate XKB-style modifier state that's
                 // updated by KeyboardEvent::Modifiers, distinct from the
@@ -2238,6 +2240,8 @@ impl CaptureTask {
                 if let Err(e) = self.conn.send_on_session(mods_zero, handle, session).await {
                     log::warn!("failed to reset modifiers on client {handle}: {e}");
                 }
+                self.release_peer_keys(handle, session, handover_serial)
+                    .await;
 
                 log::info!("sending Leave event to client {handle} session {session}");
                 let leave = match handover_serial {
