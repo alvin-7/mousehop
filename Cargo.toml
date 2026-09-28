@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.17.12"
+version = "0.17.13"
 
 [workspace.dependencies]
 input-event = { package = "mousehop-input-event", path = "input-event", version = "0.17.1" }

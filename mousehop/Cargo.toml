@@ -120,5 +120,7 @@ name = "Mousehop"
 # it back to the Resources root so NSBundle pathForResource: finds it.
 icon = ["../target/icon.icns"]
 identifier = "com.mousehop.Mousehop"
-osx_info_plist_exts = ["../build-aux/macos-lsui-element.plist"]
 resources = ["../target/menubar-template.png"]
+
+[package.metadata.bundle.osx]
+info_plist_exts = ["../build-aux/macos-lsui-element.plist"]

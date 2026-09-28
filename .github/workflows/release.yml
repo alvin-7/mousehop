@@ -177,7 +177,7 @@ jobs:
       run: cargo install cargo-bundle
     - name: Bundle
       # Must run from mousehop/ so cargo-bundle's icon / resources /
-      # osx_info_plist_exts globs resolve against the manifest dir.
+      # info_plist_exts globs resolve against the manifest dir.
       # The globs are evaluated from CWD (not the manifest), so running
       # from the workspace root silently drops the icon, the menu-bar
       # template PNG, and the LSUIElement / TCC usage-description plist.
@@ -246,7 +246,7 @@ jobs:
       run: cargo install cargo-bundle
     - name: Bundle
       # Must run from mousehop/ so cargo-bundle's icon / resources /
-      # osx_info_plist_exts globs resolve against the manifest dir.
+      # info_plist_exts globs resolve against the manifest dir.
       # The globs are evaluated from CWD (not the manifest), so running
       # from the workspace root silently drops the icon, the menu-bar
       # template PNG, and the LSUIElement / TCC usage-description plist.
