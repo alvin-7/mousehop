@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["vendor/webrtc-util"]
+exclude = ["vendor/webrtc-util", "vendor/core-graphics"]
 members = [
     "input-capture",
     "input-emulation",

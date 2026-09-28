@@ -18,11 +18,7 @@ use mousehop_cli::CliError;
 #[cfg(feature = "gtk")]
 use mousehop_gtk::GtkError;
 use mousehop_ipc::{IpcError, IpcListenerCreationError};
-use std::{
-    future::Future,
-    io,
-    process::{self, Child},
-};
+use std::{future::Future, io, process};
 use thiserror::Error;
 use tokio::task::LocalSet;
 
@@ -188,7 +184,9 @@ where
     Ok(runtime.block_on(LocalSet::new().run_until(f))?)
 }
 
-fn start_service() -> Result<Child, io::Error> {
+/// Re-exec this binary as the `daemon` child the GTK frontend supervises.
+#[cfg(feature = "gtk")]
+fn start_service() -> Result<std::process::Child, io::Error> {
     let child = process::Command::new(std::env::current_exe()?)
         .args(std::env::args().skip(1))
         .arg("daemon")

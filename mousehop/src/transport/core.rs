@@ -20,9 +20,12 @@ const OUTPUT_CAPACITY: usize = FLUSH_RESERVE + 2;
 const MAX_MESSAGE: usize = mousehop_proto::MAX_DISPLAY_LAYOUT_SIZE + 8 + 64;
 type Result<T> = std::result::Result<T, &'static str>;
 
+/// Timestamped datagrams queued between KCP and the DTLS conn.
+type PacketQueue = VecDeque<(u64, Vec<u8>)>;
+
 #[derive(Clone, Default)]
 struct Output {
-    queue: Arc<Mutex<VecDeque<(u64, Vec<u8>)>>>,
+    queue: Arc<Mutex<PacketQueue>>,
     now: Arc<AtomicU64>,
 }
 impl Write for Output {
@@ -52,8 +55,8 @@ pub(super) struct Session {
     last_peer: u64,
     kcp: Option<Kcp<Output>>,
     output: Output,
-    wire: VecDeque<(u64, Vec<u8>)>,
-    incoming: VecDeque<(u64, Vec<u8>)>,
+    wire: PacketQueue,
+    incoming: PacketQueue,
     sent: u64,
     received: u64,
     consumed: u64,
