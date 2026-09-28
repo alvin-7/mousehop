@@ -47,6 +47,8 @@ enum RepeatStopReason {
     Released,
     /// The client's session is being destroyed.
     Destroyed,
+    /// A same-connection recovery is freezing remote input.
+    Recovery,
     /// The backend itself is terminating.
     Terminated,
 }
@@ -57,6 +59,7 @@ impl RepeatStopReason {
             Self::Replaced => "replaced",
             Self::Released => "released",
             Self::Destroyed => "destroyed",
+            Self::Recovery => "recovery",
             Self::Terminated => "terminated",
         }
     }
@@ -331,12 +334,17 @@ impl MacOSEmulation {
     /// so the current sides are passed alongside the aggregate and the
     /// window server's own flags are read first so a locally held modifier is
     /// not cleared by a remote transition.
-    fn sync_remote_modifiers(&self) {
-        self.key_injector.sync_modifiers(
+    fn sync_remote_modifiers(&self) -> Result<(), EmulationError> {
+        if !self.key_injector.sync_modifiers(
             modifier_kinds(self.modifier_state.get()),
             modifier_sides(self.physical_modifiers.get()),
             local_modifier_flags(),
-        );
+        ) {
+            return Err(EmulationError::Io(std::io::Error::other(
+                "macOS modifier transition failed",
+            )));
+        }
+        Ok(())
     }
 
     /// Tell the macOS power-manager that real user input is arriving
@@ -820,6 +828,14 @@ fn active_display_layout() -> Option<DisplayLayout> {
     (!layout.is_empty()).then_some(layout)
 }
 
+fn recovery_cursor(layout: &DisplayLayout, location: CGPoint) -> Option<(i32, i32)> {
+    let point = (location.x, location.y);
+    layout
+        .rectangles()
+        .any(|(_, rect)| rect.contains_f64(point))
+        .then(|| (point.0.floor() as i32, point.1.floor() as i32))
+}
+
 /// Convert a union-relative warp target into global display
 /// coordinates.
 ///
@@ -914,7 +930,9 @@ impl Emulation for MacOSEmulation {
                     } => {
                         let click_state = self.next_button_click_state(button, state);
                         if !self.post_button_event(button, state, click_state) {
-                            return Ok(());
+                            return Err(EmulationError::Io(std::io::Error::other(
+                                "macOS mouse button injection failed",
+                            )));
                         }
 
                         // Commit state only after CoreGraphics accepted the
@@ -1032,7 +1050,7 @@ impl Emulation for MacOSEmulation {
                         // repeatable characters: one flags-changed event that
                         // carries the real key code of the side that changed,
                         // and no duplicate key event on top of it.
-                        self.sync_remote_modifiers();
+                        self.sync_remote_modifiers()?;
                         return Ok(());
                     }
                     match state {
@@ -1055,7 +1073,7 @@ impl Emulation for MacOSEmulation {
                         locked,
                         group,
                     );
-                    self.sync_remote_modifiers();
+                    self.sync_remote_modifiers()?;
                 }
             },
             Event::Clipboard(_) => {
@@ -1125,6 +1143,20 @@ impl Emulation for MacOSEmulation {
         self.physical_modifiers.set(PhysicalModifiers::empty());
         self.modifier_state.set(XMods::empty());
         log_cleanup_end(session, None, "terminate", residue);
+    }
+
+    async fn quiesce(&mut self, _handle: EmulationHandle) -> Result<(), EmulationError> {
+        self.cancel_repeat_task(RepeatStopReason::Recovery).await
+    }
+
+    fn recovery_baseline(&mut self) -> Result<super::RecoveryBaseline, EmulationError> {
+        let layout = active_display_layout().ok_or(EmulationError::DisplayTopologyUnavailable)?;
+        let location = self
+            .get_mouse_location()
+            .ok_or(EmulationError::DisplayTopologyUnavailable)?;
+        let cursor =
+            recovery_cursor(&layout, location).ok_or(EmulationError::DisplayTopologyUnavailable)?;
+        Ok(super::RecoveryBaseline { cursor, layout })
     }
 
     fn display_bounds(&mut self) -> Option<(u32, u32)> {

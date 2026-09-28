@@ -145,6 +145,8 @@ thread_local! {
     /// Momentary modifiers observed by the global low-level keyboard hook,
     /// including presses that happened before an edge activated capture.
     static HOST_MODIFIERS: RefCell<HashSet<Linux>> = RefCell::new(HashSet::new());
+    /// Key-downs the host saw before capture must get matching host key-ups.
+    static HOST_VISIBLE_MODIFIERS: RefCell<HashSet<Linux>> = RefCell::new(HashSet::new());
     /// Optional per-edge preflight. An absent entry preserves immediate edge
     /// capture without adding any modifier check.
     static CROSSING_MODIFIERS: RefCell<HashMap<Position, CrossingModifier>> = RefCell::new(HashMap::new());
@@ -302,6 +304,7 @@ fn start_routine(
                 x if x == RequestType::Exit as usize => break,
                 x if x == RequestType::Release as usize => {
                     ACTIVE_CLIENT.take();
+                    HOST_VISIBLE_MODIFIERS.with_borrow_mut(HashSet::clear);
                 }
                 x if x == RequestType::ClientUpdate as usize => {
                     let requests = {
@@ -435,6 +438,9 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
 
     /* update active client and entry point */
     ACTIVE_CLIENT.replace(Some(pos));
+    HOST_VISIBLE_MODIFIERS.with_borrow_mut(|visible| {
+        HOST_MODIFIERS.with_borrow(|pressed| visible.clone_from(pressed));
+    });
     let entry_point = DISPLAYS.with_borrow(|(displays, _)| {
         display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos)
     });
@@ -512,6 +518,14 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         log::warn!("e: {e}");
     }
 
+    if let KeyboardEvent::Key { key, state: 0, .. } = key_event {
+        if let Ok(key) = Linux::try_from(key) {
+            if HOST_VISIBLE_MODIFIERS.with_borrow_mut(|visible| visible.remove(&key)) {
+                return CallNextHookEx(None, ncode, wparam, lparam);
+            }
+        }
+    }
+
     /* don't pass event to applications */
     LRESULT(1)
 }
@@ -534,6 +548,7 @@ unsafe extern "system" fn window_proc(
             WTS_SESSION_LOCK => {
                 HOST_LOCKED.set(true);
                 HOST_MODIFIERS.with_borrow_mut(HashSet::clear);
+                HOST_VISIBLE_MODIFIERS.with_borrow_mut(HashSet::clear);
                 if let Some(pos) = ACTIVE_CLIENT.take() {
                     log::info!("host session locked mid-capture; releasing");
                     let _ = try_send_event(pos, CaptureEvent::AutoRelease);
@@ -711,6 +726,7 @@ fn update_clients(request: ClientUpdate) {
             if let Some(active_pos) = ACTIVE_CLIENT.get() {
                 if pos == active_pos {
                     let _ = ACTIVE_CLIENT.take();
+                    HOST_VISIBLE_MODIFIERS.with_borrow_mut(HashSet::clear);
                 }
             }
             CLIENTS.with_borrow_mut(|clients| clients.remove(&pos));

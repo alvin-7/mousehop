@@ -163,13 +163,19 @@ queue consumption. Legacy input/warp requests cannot bypass a managed token.
 Windows incoming connections advertise recovery only after the Windows backend
 is available and its actual cursor baseline can be read. `recovery_available()`
 performs this read-only probe; denied desktop access leaves capability disabled.
-macOS and other receiving backends return `RecoveryUnsupported` until their
-per-handle background-task and cursor-baseline guarantees are implemented.
+macOS receiving connections advertise recovery only while Quartz can read an
+active display layout and a cursor position on that layout. Its recovery
+barrier joins the key-repeat task before releasing tracked input and reading
+the new baseline. The capability is re-probed as the desktop changes, so a
+temporary absence of active displays does not persist for the daemon lifetime.
+Other receiving backends return `RecoveryUnsupported` until
+their background-task and cursor-baseline guarantees are implemented.
 Windows currently reports virtual-screen bounding geometry, not individual
 monitor contours. A hung backend keeps the gate closed: the driver enforces its
 hard deadline and arranges delayed cleanup without cancelling the serial backend
-worker. Mac outgoing capture participates without invoking a local emulation
-barrier or injecting a dummy cursor baseline into the OS.
+worker. Windows and Mac outgoing KCP capture participate only when the receiving
+backend advertises recovery; neither invokes a local emulation barrier or
+injects a dummy cursor baseline into the OS.
 
 ## Same-connection recovery protocol (0.17.12)
 

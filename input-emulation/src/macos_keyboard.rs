@@ -701,7 +701,7 @@ impl KeyboardInjector {
         aggregate: ModifierKinds,
         known: ModifierSides,
         local_flags: u32,
-    ) {
+    ) -> bool {
         let desired = desired_sides(aggregate, known);
         let mut state = self.state.borrow_mut();
         state.local_flags = local_flags;
@@ -709,6 +709,7 @@ impl KeyboardInjector {
         // below are posted, and a per-step baseline would turn the sides this
         // backend has just released into locally held bits.
         let locally_held = locally_held_flags(local_flags, state.remote_flags);
+        let mut accepted = true;
         for (side, next) in transitions(state.held_sides, desired) {
             let flags = locally_held | flags_for(next);
             let injection = Injection::Modifiers {
@@ -718,6 +719,7 @@ impl KeyboardInjector {
             if self.post(&mut state, injection).is_err() {
                 // Leave the recorded state at the last side macOS accepted;
                 // cleanup releases exactly that.
+                accepted = false;
                 break;
             }
             state.held_sides = next;
@@ -726,6 +728,7 @@ impl KeyboardInjector {
         }
         self.settle(&mut state);
         self.log_snapshot(&mut state, aggregate, known, desired);
+        accepted
     }
 
     /// Writes one `modifier_snapshot` line per distinct state.

@@ -878,7 +878,7 @@ async fn connect_to_handle(
         } else {
             crate::transport::InputTransport::Legacy
         };
-        let conn = if cfg!(target_os = "macos") {
+        let conn = if cfg!(any(target_os = "macos", target_os = "windows")) {
             crate::transport::attach_recoverable(conn, Some(mode), kcp_timeouts)
         } else {
             crate::transport::attach(conn, Some(mode), kcp_timeouts)

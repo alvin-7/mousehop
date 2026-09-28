@@ -1308,6 +1308,10 @@ impl ListenTask {
                     }
                 }
                 _ = topology_interval.tick() => {
+                    self.listener.set_recovery_available(
+                        self.emulation_proxy.recovery_supported.get()
+                            && self.emulation_proxy.emulation_active.get(),
+                    );
                     // Republish the complete current topology to every
                     // actively responding peer, even when it is unchanged.
                     // These are UDP datagrams with no topology Ack; advancing
@@ -1968,6 +1972,10 @@ impl EmulationTask {
                 _ = bounds_poll.tick() => {
                     let current_layout = emulation.display_layout();
                     let current_bounds = current_layout.as_ref().and_then(DisplayLayout::size);
+                    let recovery_supported = emulation.recovery_available();
+                    if self.recovery_supported.replace(recovery_supported) != recovery_supported {
+                        log::info!("input recovery availability changed: {recovery_supported}");
+                    }
                     if current_bounds != self.display_bounds.get()
                         || self.display_layout.borrow().as_ref() != current_layout.as_ref()
                     {
